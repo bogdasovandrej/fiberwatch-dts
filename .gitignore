@@ -1,0 +1,29 @@
+# окружение
+.venv/
+__pycache__/
+*.py[cod]
+
+# данные организаторов, разметка и результаты прогонов в репозиторий не входят
+data/
+cases/
+*.csv
+*.csv.gz
+run_*/
+check_run/
+result_*/
+review/
+*.log
+
+# веса моделей
+*.pt
+*.joblib
+*.pkl
+*.zip
+
+# локальные остатки прошлых версий
+artifacts/
+src/
+app/
+scripts/
+tests/
+*.egg-info/
