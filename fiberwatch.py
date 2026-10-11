@@ -1,49 +1,4 @@
-"""FiberWatch v5.4.1: обнаружение температурных событий в данных DTS МГТС.
-
-v5.4.1 - исправления по итогам полного аудита: склейка событий по координате в точках
-волокна (а не в столбцах просмотра), --detect проверяет все координаты, понятные сообщения
-для короткой записи, повторов времени и ошибок входных данных. Модели и правило не менялись.
-
-v5.4 по итогам четвёртого раунда (случаи, где модели расходятся): порог зоны больше не
-поднимается выше общего порога модели. После правила «>= 3 °C от фона» он уже не гасил шум,
-а выключал нейросеть: в зонах, где её оценка за пусконаладку доходила до 1,0, порог тоже
-становился 1,0 (18 из 59 зон 1.csv, 4 из 9 зон 5.csv), и настоящие события там пропускались.
-
-v5.3 по итогам третьего раунда: изменение для правила 3 °C дополнительно меряется так, как его
-видит человек, - от обычного фона ДО окна (медиана 80 минут перед окном) до наибольшего
-среднего двух соседних замеров (одиночный выброс засчитывается наполовину). Случайный «горб» в первых минутах окна больше
-не завышает перепад. Если модель «за», а изменение от фона меньше порога - это запись
-в журнал «около порога» (утверждённая политика 2-3 °C), а не уведомление.
-
-v5.2 по итогам второго раунда слепой разметки: (1) уведомление требует и решения модели, и
-измеренного изменения (устойчивого или краткого пика) >= max(3 °C, 4 x шум окна) - утверждённое правило проверяется явно,
-а не только «выучено» моделью; (2) повторные срабатывания на том же участке не позже чем
-через 40 минут (длина окна) - продолжение того же события, а не новое уведомление.
-
-v5.1 по итогам слепой разметки 67 реальных случаев: (1) общий для всего волокна скачок
-профиля (эффект прибора, найден в 1.csv) вычитается до анализа; (2) изменения 1.5-3 °C
-учатся как «не уведомлять» - это утверждённая политика «2-3 °C - журнал без уведомления»;
-(3) краткие выбросы в синтетике уже (до 3 точек), чтобы не путать их со сдвигом всего волокна.
-
-v5 относительно v4.1: свёрточная сеть по времени И координате (cnn2d) видит 9 соседних точек
-волокна. Настоящее изменение температуры захватывает соседние точки (тепло распространяется,
-прибор усредняет по длине), а шум и сбой измерения обычно затрагивают одну точку. Одноточечный
-однозамерный выброс (как F5-02) считается вероятным сбоем измерения, а не температурным событием.
-Обучение работает и без ручной разметки: она нужна только для слепой проверки.
-
-v4.1 относительно v4.0: опорный уровень по первым 6 минутам окна, оценка шума окна как
-отдельный вход, шумовая аугментация обучающего фона и метка события с учётом шума
-(изменение >= max(3 °C, 4 x шум)). Причина правки - ложные тревоги v4.0 на шумном приборе 5.csv.
-
-Один файл: чтение -> проверка качества -> окна -> признаки -> обучение -> оценка -> события.
-Таблицы читает и преобразует Pandas. PyTorch нужен для CNN, scikit-learn для леса и метрик.
-
-Главная идея v4. Ручной разметки мало (28 фрагментов), и она почти разделяется одним
-порогом. Поэтому модели учатся на тысячах окон НАСТОЯЩЕГО фона из исходных CSV, в которые
-мы добавляем синтетические нагревы/охлаждения/выбросы с известной амплитудой. Ручные
-карточки в обучение не попадают вообще и служат слепой проверкой. Оценка идёт
-leave-one-device-out: прибор, на котором проверяем, не участвует в обучении и подборе порога.
-"""
+"""FiberWatch v5.4.1: обнаружение температурных событий в данных МГТС."""
 import argparse
 import hashlib
 import json
@@ -62,22 +17,22 @@ from sklearn.metrics import confusion_matrix, fbeta_score, precision_score, reca
 
 ROOT = Path(__file__).resolve().parent
 WINDOW = pd.Timedelta(minutes=40)       # сколько истории видит модель
-BIN = pd.Timedelta(minutes=2)           # шаг агрегирования: делает файлы с разной частотой сопоставимыми
+BIN = pd.Timedelta(minutes=2)           # шаг агрегирования
 N_BINS = 20
-MAX_GAP = pd.Timedelta(minutes=10)      # больший разрыв = окно не строим (не склеиваем ненаблюдаемое)
-INVALID_BELOW = -273.15                 # ниже абсолютного нуля температура физически невозможна
-REFERENCE_SPAN = pd.Timedelta(minutes=6)  # опорный уровень: медиана первых 6 минут (не менее 3 замеров)
-NOISE_FACTOR = 4.0                         # событие должно быть больше 4 «шумов» окна
+MAX_GAP = pd.Timedelta(minutes=10)      
+INVALID_BELOW = -273.15                 # порог
+REFERENCE_SPAN = pd.Timedelta(minutes=6)  
+NOISE_FACTOR = 4.0                         
 CHANNELS = ['median_relative_c', 'min_relative_c', 'max_relative_c', 'observed', 'noise_c']
-EVENT_C = 3.0      # политика команды: изменение >= 3 °C -> «требуется проверка»
-SMALL_C = 1.5      # изменение <= 1.5 °C -> обычное поведение (и порог «спокойного» фона)
+EVENT_C = 3.0      # изменение >= 3 °C -> «требуется проверка»
+SMALL_C = 1.5      # изменение <= 1.5 °C -> обычное поведение 
 GREY_MAX_C = 2.8   # мелкие изменения до 2.8 °C учим как «не уведомлять»: политика 2-3 °C = журнал
 COMMON_MODE_MIN_C = 0.5  # общий сдвиг всего волокна меньше 0.5 °C не трогаем
-ZONE_COORDINATES = 200   # зона = 200 соседних координат (с v5.4 порог во всех зонах общий, зоны - для отчёта)
+ZONE_COORDINATES = 200   # зона = 200 соседних координат
 BACKGROUND_SPAN = pd.Timedelta(minutes=80)  # фон для правила: медиана 80 минут перед окном
-COMMISSIONING_SHARE = .3 # первые 30% записи прибора = «пусконаладка»: события помечаются, оценка - по остальным 70%
-RADIUS = 4               # cnn2d видит точку и по 4 соседа с каждой стороны: 9 координат
-CNN_WIDTHS = (16, 32)    # ширины сети, из которых выбираем по проверочной части обучения
+COMMISSIONING_SHARE = .3 # первые 30% пусконаладка
+RADIUS = 4               # 9 координат
+CNN_WIDTHS = (16, 32)    # ширины сети
 MAX_EPOCHS = 150
 MODELS = ['amplitude_rule', 'noise_rule', 'range_rule', 'random_forest', 'cnn', 'cnn2d']
 NAMES = {'amplitude_rule': 'Правило: отклонение медианы', 'noise_rule': 'Правило с учётом шума',
@@ -86,16 +41,9 @@ NAMES = {'amplitude_rule': 'Правило: отклонение медианы'
 
 
 def set_event_c(value):
-    """Порог уведомления, °C (по умолчанию 3). Серая зона «не уведомлять» в обучении - до порога минус 0,2 °C.
-
-    Меняет и метки обучения, и правило уведомления, и журнал медленных изменений. Порог
-    сохраняется вместе с моделями, и --detect берёт его оттуда.
-    """
     global EVENT_C, GREY_MAX_C
     EVENT_C, GREY_MAX_C = float(value), max(.5, float(value) - .2)
 
-
-# ---------------------------------------------------------------- 1. Чтение и качество
 
 def read_source(path):
     """CSV МГТС -> таблица «время x координата». Одна строка CSV = один профиль вдоль волокна."""
@@ -109,7 +57,7 @@ def read_source(path):
     matrix.index = times
     matrix = matrix.sort_index(kind='stable')
     duplicates = int(matrix.index.duplicated(keep='last').sum())
-    matrix = matrix.loc[~matrix.index.duplicated(keep='last')]   # повтор профиля (переотправка): берём последний
+    matrix = matrix.loc[~matrix.index.duplicated(keep='last')]   
     matrix = matrix.sort_index(axis=1)
     step = matrix.index.to_series().diff().dt.total_seconds()
     invalid = matrix.lt(INVALID_BELOW)
@@ -130,12 +78,10 @@ def read_source(path):
 
 
 def remove_common_mode(matrix):
-    """Вычесть общий для всего волокна скачок профиля - эффект прибора, а не объекта.
-
+    """
     Для каждого профиля берём медиану по всем точкам волокна от отклонения «замер минус
     медиана этой точки за прошлые 20 минут». Локальное событие затрагивает единицы точек из
-    тысяч и медиану почти не двигает; сдвиг всего волокна разом (в 1.csv: 60% точек на
-    -1.2 °C ровно на один профиль) - двигает. Вычитаем только сдвиги от 0.5 °C, остальное
+    тысяч и медиану почти не двигает; сдвиг всего волокна разом - двигает. Вычитаем только сдвиги от 0.5 °C, остальное
     не трогаем. Значения -300 остаются как есть. Используется только прошлое.
     """
     valid = matrix.loc[:, matrix.notna().all() & matrix.ge(INVALID_BELOW).all()]
@@ -154,27 +100,22 @@ def window_ends(matrix):
     return times.loc[times - block_start >= WINDOW - pd.Timedelta(minutes=2)].index
 
 
-# ---------------------------------------------------------------- 2. Представление окна
-
 def represent(rows, end):
     """Окно (время x ряды) -> 20 интервалов по 2 минуты относительно опорного уровня.
-
     median - уровень, min/max - короткие выбросы, observed - был ли в интервале замер.
-    Опорный уровень = медиана замеров первых 6 минут окна, но не менее трёх замеров
-    (не «норма», а точка отсчёта). При шаге 2 минуты это ровно три замера, как в v3;
+    Опорный уровень = медиана замеров первых 6 минут окна, но не менее трёх замеров.
+    При шаге 2 минуты это ровно три замера
     при шаге 10 секунд - 36 замеров вместо 20 секунд, поэтому шум меньше сдвигает опору.
-    noise - оценка шума окна по соседним разностям (робастная, выбросы на неё почти не влияют).
+    noise - оценка шума окна по соседним разностям.
     """
     start = end - WINDOW
     rows = rows.loc[(rows.index > start) & (rows.index <= end)]
     if len(rows) < 3 or rows.index.to_series().diff().gt(MAX_GAP).any():
         return None
     position = (rows.index - start) / BIN
-    bin_number = [int(-((-value) // 1)) for value in position]   # округление вверх: интервал (k-1, k]
+    bin_number = [int(-((-value) // 1)) for value in position]  
     reference = reference_level(rows, start)
     relative = rows - reference
-    # Series, а не список: список pandas принял бы за названия столбцов, если координаты - целые
-    # числа 1..20 (так и есть в 5.csv), и сгруппировал бы не по времени.
     grouped = relative.groupby(pd.Series(bin_number, index=relative.index))
     bins = list(range(1, N_BINS + 1))
     observed = grouped.count().T.reindex(columns=bins).fillna(0).gt(0)
@@ -190,25 +131,16 @@ def represent(rows, end):
 
 
 def reference_level(rows, start):
-    """Медиана замеров первых 6 минут окна (если их меньше трёх - первых трёх замеров)."""
+    """Медиана замеров первых 6 минут окна"""
     early = rows.loc[rows.index <= start + REFERENCE_SPAN]
     return (early if len(early) >= 3 else rows.iloc[:3]).median()
 
 
 def noise_sigma(rows):
-    """Шум окна, °C: 1.4826 * медиана |разности соседних замеров| / sqrt(2).
-
-    Для белого шума это оценка его стандартного отклонения. Медиана вместо среднего -
-    чтобы сам нагрев или одиночный выброс почти не увеличивал оценку шума.
-    """
     return rows.diff().abs().median() * 1.4826 / math.sqrt(2)
 
 
 def to_tensor(parts):
-    """[число окон, 5 каналов, 20 интервалов]; температуры в единицах 10 °C, как в v3.
-
-    Пятый канал - шум окна, повторённый по всем 20 интервалам: свёртке так проще его учесть.
-    """
     stacked = [torch.tensor(parts[name].to_numpy(dtype='float32')) / (10. if name != 'observed' else 1.)
                for name in ['median', 'min', 'max', 'observed']]
     noise = torch.tensor(parts['noise'].to_numpy(dtype='float32')).unsqueeze(1).expand(-1, N_BINS) / 10.
@@ -216,7 +148,6 @@ def to_tensor(parts):
 
 
 def features(parts):
-    """Признаки для леса: те же 10 чисел, что extract_features в v3, но сразу для многих окон."""
     observed = parts['observed'].astype(bool)
     median = parts['median'].where(observed)
     low, high = parts['min'].where(observed), parts['max'].where(observed)
@@ -244,28 +175,20 @@ def features(parts):
 
 
 def amplitude(parts):
-    """Наибольшее отклонение медианы от опорного уровня и наибольший выброс min/max, °C."""
     level = parts['median'].abs().max(axis=1)
     spike = pd.concat([parts['max'].max(axis=1), -parts['min'].min(axis=1)], axis=1).max(axis=1)
     return level, spike
 
 
 def subset(parts, columns):
-    """Представление только для выбранных координат (признаки леса считаем не для всех)."""
     return {k: v.loc[columns] for k, v in parts.items()}
 
 
 def neighbours(names, position):
-    """Метки координат position-RADIUS..position+RADIUS; за краем волокна - None."""
     return [names[i] if 0 <= i < len(names) else None for i in range(position - RADIUS, position + RADIUS + 1)]
 
 
 def patches(parts, neighbour_lists):
-    """[окна, 5 каналов, 9 соседних координат, 20 интервалов] для cnn2d.
-
-    Сосед, которого нет (край волокна, пропуск, -300), остаётся нулём с observed = 0:
-    модель видит, что там нет данных, а не «температура не менялась».
-    """
     full = to_tensor(parts)
     position = {c: i for i, c in enumerate(parts['median'].index)}
     index = torch.tensor([[position.get(c, 0) for c in row] for row in neighbour_lists])
@@ -274,15 +197,7 @@ def patches(parts, neighbour_lists):
     return out.permute(0, 2, 1, 3).contiguous()
 
 
-# ---------------------------------------------------------------- 3. Синтетические события на реальном фоне
-
 def injected_shape(kind, minutes, onset, size, rng):
-    """Форма добавляемого изменения температуры (°C) в моменты замеров.
-
-    Тепло передаётся к волокну с задержкой, поэтому ступень - экспонента
-    1 - exp(-t/tau), а не мгновенный скачок. Параметры - инженерные диапазоны для обучения,
-    а не характеристики конкретного объекта МГТС.
-    """
     t = (torch.tensor(minutes, dtype=torch.float64) - onset).clamp(min=0.)
     started = torch.tensor(minutes, dtype=torch.float64) >= onset
     if kind in ('step', 'small'):
@@ -308,8 +223,7 @@ def injected_shape(kind, minutes, onset, size, rng):
 
 
 def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose, augment_noise=False, keep_raw=False):
-    """Окна реального фона + синтетические события. Возвращает (x, x2, признаки, паспорт[, сырые ряды]).
-
+    """Окна реального фона + синтетические события.
     Метка задаётся физически измеримой реализованной амплитудой добавки в центральной точке:
     >= max(3 °C, 4 x шум окна) -> 1 («требуется проверка»), ниже -> 0 (с v5.1 и серая зона
     1.5-3 °C - это «не уведомлять»). Фон берём только «спокойный», чтобы настоящее событие не стало ответом 0.
@@ -332,7 +246,7 @@ def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose
         candidates = [i for i, c in enumerate(names) if valid[c] and c not in blocked]
         rng.shuffle(candidates)
         targets, taken = [], []
-        for i in candidates:     # центры не ближе 2*RADIUS+2: добавки соседних центров не пересекаются
+        for i in candidates:     
             if all(abs(i - j) > 2 * RADIUS + 1 for j in taken):
                 taken.append(i)
                 targets.append(names[i])
@@ -346,7 +260,7 @@ def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose
         if natural is None:
             continue
         natural_level, natural_spike = amplitude(subset(natural, targets))
-        # «спокойный» фон: заметно ниже порога (при пороге 3 °C - уровень < 1,5 °C и выброс < 4 °C)
+    
         quiet = [t for t in targets if natural_level[t] < min(1.5, EVENT_C / 2) and natural_spike[t] < EVENT_C + 1.]
         minutes = ((rows.index - start) / pd.Timedelta(minutes=1)).tolist()
         delta = pd.DataFrame(0., index=rows.index, columns=local)
@@ -380,7 +294,6 @@ def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose
                     offset = position[c] - position[target]
                     weight = 1. if offset == 0 else (math.exp(-offset ** 2 / (2 * width ** 2)) if width > 0 else 0.)
                     delta[c] = delta[c] + values * weight
-            # Ниже порога уведомления - «не уведомлять» (журнал), включая серую зону 1.5-3 °C.
             label = 0 if kind == 'glitch' else int(realized >= event_threshold)
             meta.append({'target': target, 'column': target, 'position': position[target], 'kind': kind,
                          'realized_c': realized, 'spatial_width': width, 'label': label,
@@ -411,10 +324,7 @@ def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose
     return result + (raws,) if keep_raw else result
 
 
-# ---------------------------------------------------------------- 4. Модели
-
 class TemperatureCNN(nn.Module):
-    """Та же архитектура, что в v3: две свёртки по времени, затем среднее и максимум по окну."""
     def __init__(self, width):
         super().__init__()
         self.filters = nn.Sequential(nn.Conv1d(len(CHANNELS), width, 3, padding=1), nn.ReLU(),
@@ -446,7 +356,6 @@ class SpatialCNN(nn.Module):
 
 
 def train_cnn(x_train, y_train, x_val, y_val, width, seed, factory=TemperatureCNN, max_epochs=None, patience=10):
-    """Мини-пакеты по 256 окон; лучшая эпоха выбирается по ошибке на проверочной части обучения."""
     max_epochs = max_epochs or MAX_EPOCHS
     torch.manual_seed(seed)
     model = factory(width)
@@ -484,7 +393,6 @@ def scores(name, model, x, table, x2=None):
     if name == 'amplitude_rule':
         return pd.Series(table['level_c'].values)
     if name == 'noise_rule':
-        # Отклонение медианы в долях порога max(3 °C, 4 x шум): 1.0 = ровно на пороге.
         return pd.Series((table['level_c'] / (table['noise_c'] * NOISE_FACTOR).clip(lower=EVENT_C)).values)
     if name == 'range_rule':
         return pd.Series(table['range_c'].values)
@@ -500,14 +408,12 @@ FEATURES = ['range_c', 'median_range_c', 'std_c', 'net_change_c', 'absolute_net_
 
 
 def choose_threshold(labels, values):
-    """Порог с максимальным F2 (полнота важнее точности - решение команды «меньше пропусков»)."""
     candidates = sorted(set(values.quantile([i / 200 for i in range(1, 200)]).round(6)))
     best = max(candidates, key=lambda t: (fbeta_score(labels, values.ge(t), beta=2, zero_division=0), t))
     return float(best)
 
 
 def fit_all(x, x2, table, passport, seed):
-    """Обучение всех моделей на окнах обучающих приборов; 20% окон (по времени) - для порога и эпох."""
     rng = random.Random(seed)
     slots = sorted(passport[['file', 'end']].drop_duplicates().itertuples(index=False, name=None))
     validation_slots = set(rng.sample(slots, max(1, len(slots) // 5)))
@@ -523,7 +429,6 @@ def fit_all(x, x2, table, passport, seed):
             model = RandomForestClassifier(n_estimators=300, min_samples_leaf=3, n_jobs=-1, random_state=seed)
             model.fit(table.loc[train_idx, FEATURES], passport.label.iloc[train_idx])
         elif name in ('cnn', 'cnn2d'):
-            # Ширину выбираем по ошибке на проверочной части, а не по тестовому прибору.
             inputs, factory = (x, TemperatureCNN) if name == 'cnn' else (x2, SpatialCNN)
             trials = [train_cnn(inputs[train_idx], y[train_idx], inputs[val_idx], y[val_idx], width, seed, factory)
                       for width in CNN_WIDTHS]
@@ -548,8 +453,6 @@ def evaluate(labels, flags):
             'f2': fbeta_score(labels, flags, beta=2, zero_division=0)}
 
 
-# ---------------------------------------------------------------- 5. Ручные карточки (слепой тест)
-
 def load_cards(annotations_path, cases_dir):
     annotations = pd.read_csv(annotations_path).set_index('sample_id')
     cards = {}
@@ -561,7 +464,6 @@ def load_cards(annotations_path, cases_dir):
 
 
 def card_inputs(cards, sample_ids, annotations, matrices):
-    """Ручные фрагменты в виде входов моделей; соседи для cnn2d берутся из исходного файла."""
     tensors, tensors2, tables = [], [], []
     for sample_id in sample_ids:
         matrix = matrices[annotations.loc[sample_id, 'source_file']]
@@ -583,7 +485,6 @@ def card_inputs(cards, sample_ids, annotations, matrices):
 
 
 def exclusion_zones(annotations, matrices):
-    """Места ручных карточек (+-15 координат) не используются как фон для обучения."""
     zones = {}
     for sample_id, row in annotations.iterrows():
         matrix = matrices[row.source_file]
@@ -596,7 +497,6 @@ def exclusion_zones(annotations, matrices):
     return zones
 
 
-# ---------------------------------------------------------------- 6. Сплошной просмотр и объединение в события
 
 def scan(matrix, fitted, every_minutes=10, max_columns=1500):
     """Применить модели ко всей записи: окна каждые ~10 минут, координаты с шагом stride.
@@ -673,27 +573,17 @@ def rule_passes(grid):
 
 
 def calibrate(grid, fitted, cutoff):
-    """Решение для оператора: порог модели + правило уведомления.
-
-    До v5.4 порог зоны поднимался до 99-го перцентиля её оценок за пусконаладку (гасил шум
-    1.csv и 5.csv). С правилом «>= 3 °C от фона» шум гасит правило, а поднятый порог упирался
-    в 1,0 и выключал модель, поэтому в v5.4 во всех зонах общий порог модели.
-    Уведомление дополнительно требует измеренного изменения не меньше лимита правила:
-    модель решает «похоже ли на событие», правило - «достаточно ли оно велико».
-    Модель «за», правило «нет» -> _border: журнал «около порога», без уведомления.
-    """
     passes = rule_passes(grid)
     early = grid.loc[grid.end <= cutoff]
     zone = early.position // ZONE_COORDINATES
     thresholds = {}
     for name in MODELS:
-        # v5.4: общий порог во всех зонах (см. шапку файла); пусконаладка остаётся периодом наблюдения.
         thresholds[name] = pd.Series(fitted[name][1], index=sorted(zone.unique()))
         grid[name + '_zones'] = grid[name + '_score'].ge(
             (grid.position // ZONE_COORDINATES).map(thresholds[name]).fillna(fitted[name][1]))
         grid[name + '_border'] = grid[name + '_zones'] & ~passes
         grid[name + '_zones'] = grid[name + '_zones'] & passes
-        grid[name + '_notify'] = grid[name] & passes   # пусконаладка: общий порог + правило
+        grid[name + '_notify'] = grid[name] & passes   # пусконаладка
     return thresholds
 
 
@@ -750,7 +640,6 @@ def merge_events(grid, model, columns):
     return events.reset_index()
 
 
-# ---------------------------------------------------------------- 7. Эксперимент целиком
 
 def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=110, columns_per_end=24):
     started = time.perf_counter()
@@ -775,7 +664,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
     else:
         print('Разметка не задана: обучаемся на синтетике, слепой тест на ручных фрагментах пропускаем', flush=True)
         annotations, cards = pd.DataFrame(columns=['source_file', 'coordinate', 'start', 'end', 'label']), {}
-    # Контроль: карточки действительно вырезаны из этих исходников (те же числа).
     for sample_id, row in annotations.iterrows():
         matrix = matrices[row.source_file]
         column = matrix.columns[matrix.columns.get_indexer([row.coordinate], method='nearest')[0]]
@@ -824,7 +712,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
         histories += [dict(row, fold=fold) for row in fitted.pop('_cnn_history')]
         fit_logs += [dict(row, fold=fold, held_out=';'.join(test_files)) for row in log]
 
-        # (а) синтетические события на фоне проверяемого прибора
         tx = torch.cat([examples[f + ':test'][0] for f in test_files])
         tx2 = torch.cat([examples[f + ':test'][1] for f in test_files])
         ttable = pd.concat([examples[f + ':test'][2] for f in test_files], ignore_index=True)
@@ -836,7 +723,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
             tpass[name + '_score'] = values.values
             tpass[name] = values.ge(threshold).astype(int).values
 
-        # (б) ручные карточки проверяемого прибора - слепой тест
         mask = binary.device.eq(device).to_list()
         idx = [i for i, m in enumerate(mask) if m]
         for name in MODELS if idx else []:
@@ -850,7 +736,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
                                   'rule_ok': bool(rule_ok.iloc[i]),
                                   'target': int(binary.loc[sample_id, 'target'])})
 
-        # (в) нагрузка на оператора: вся запись проверяемого прибора
         for name_file in test_files:
             grid, stride = scan(matrices[name_file], fitted)
             columns = list(grid.coordinate.drop_duplicates().sort_values())
@@ -869,7 +754,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
                                       'coordinate_stride': stride})
                     if len(events):
                         all_events.append(events.assign(file=name_file, model=name, threshold_mode=mode, fold=fold))
-                # Чувствительность после калибровки: синтетика этого файла после пусконаладки.
                 in_file = tpass.file.eq(name_file)
                 zone_of = tpass.position // ZONE_COORDINATES
                 limit = zone_of.map(zone_thresholds[name]).fillna(fitted[name][1])
@@ -925,7 +809,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
     summary = pd.DataFrame(summary)
     summary.to_csv(output / 'summary.csv', index=False, encoding='utf-8-sig')
 
-    # Финальные модели для применения: все приборы. Их ответы на обучающих данных не являются оценкой.
     x = torch.cat([examples[f][0] for f in matrices])
     x2 = torch.cat([examples[f][1] for f in matrices])
     table = pd.concat([examples[f][2] for f in matrices], ignore_index=True)
@@ -949,8 +832,6 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
     print(summary.round(3).to_string(index=False))
 
 
-# ---------------------------------------------------------------- 8. Графики для отчёта
-
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -961,7 +842,6 @@ PLOT_STYLE = ({'font.size': 10, 'axes.spines.top': False, 'axes.spines.right': F
 
 
 def separability(cards_dir, annotations, out):
-    """Почему v3 нельзя было честно сравнить: 28 карточек делятся одним числом."""
     rows = []
     for sample_id, row in annotations.iterrows():
         if row.label not in ('событие', 'нет события'):
@@ -1140,7 +1020,6 @@ def heatmap(run, data_dir, out, name='4.csv', model='cnn2d'):
 
 
 def v3_vs_v4(table_path, out):
-    """До и после дообучения на одних и тех же окнах чужих приборов (результат compare_v3.py)."""
     table = pd.read_csv(table_path).set_index('model')
     order = ['cnn_v3', 'random_forest_v3', 'policy_3c', 'random_forest', 'cnn', 'cnn2d']
     labels = ['CNN v3 (28 карточек)', 'Лес v3 (28 карточек)', 'Правило «3 °C»', 'Лес v5.4',
@@ -1185,8 +1064,6 @@ def render_figures(run, data_dir, annotations_path, cases_dir, v3_table=None):
     tracks_figure(run / 'tracks', out)
     print('графики сохранены в', out)
 
-
-# ---------------------------------------------------------------- 9. Движущиеся и точечные нагревы
 
 def hot_points(matrix, rise=4.0, history='6min'):
     """Замеры, которые на >= rise °C выше медианы СВОЕЙ ЖЕ координаты за прошлые 6 минут.
@@ -1337,8 +1214,6 @@ def glitch_points(matrix, jump=4.0, calm=1.5, history='6min'):
     return found
 
 
-# ---------------------------------------------------------------- 10. Применение к новому файлу
-
 def load_final(model_dir):
     """Итоговые модели (обучены на всех приборах), их пороги и порог уведомления, на который их учили."""
     fitted = joblib.load(model_dir / 'final_other.joblib')
@@ -1441,7 +1316,6 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
 
 
 def main():
-    # Консоль Windows может не уметь печатать отдельные символы: заменяем их, а не падаем.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors='replace')
@@ -1487,6 +1361,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, FileNotFoundError) as error:   # ошибки входных данных - коротко, без трассировки
+    except (ValueError, FileNotFoundError) as error:   
         print(f'Ошибка: {error}', file=sys.stderr)
         sys.exit(2)
