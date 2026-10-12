@@ -54,7 +54,7 @@ def draw(matrix, coordinate, end, path):
     position = wide.index(coordinate)
     bottom.add_patch(plt.Rectangle((position - fw.RADIUS - .5, -40), 2 * fw.RADIUS + 1, 40, fill=False, edgecolor='#4fc3f7', lw=1.6))
     bottom.set_xticks([0, position, len(wide) - 1], [f'{wide[0]:.1f}', f'{coordinate:.1f}', f'{wide[-1]:.1f}'])
-    bottom.set_xlabel('координата вдоль волокна (единица не подтверждена)')
+    bottom.set_xlabel('расстояние вдоль волокна, м')
     bottom.set_ylabel('минуты')
     fig.tight_layout()
     fig.savefig(path, dpi=90)

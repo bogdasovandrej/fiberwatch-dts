@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import torch
 from torch import nn
@@ -28,6 +29,11 @@ COMMON_MODE_MIN_C = 0.5
 BACKGROUND_SPAN = pd.Timedelta(minutes=80)
 COMMISSIONING_SHARE = .3
 RADIUS = 4
+SHORT_MIN = 10
+WIDE_M = 5.
+SAME_PLACE_M = 1.
+SAME_TIME = pd.Timedelta(minutes=10)
+PERIODIC_SPREAD = .25
 MODELS = ['amplitude_rule', 'random_forest', 'cnn2d']
 NAMES = {'amplitude_rule': 'Правило: отклонение медианы', 'random_forest': 'Случайный лес',
          'cnn2d': 'CNN время × координата'}
@@ -559,6 +565,136 @@ def merge_events(grid, model, columns):
     return events.reset_index()
 
 
+def filled(flags):
+    out = flags.copy()
+    out[1:-1] |= flags[:-2] & flags[2:]
+    return out
+
+
+def run_bounds(flags, i, breaks):
+    low = high = i
+    while low > 0 and flags[low - 1] and not breaks[low]:
+        low -= 1
+    while high < len(flags) - 1 and flags[high + 1] and not breaks[high + 1]:
+        high += 1
+    return low, high
+
+
+def count_bursts(series, high, low, rest=pd.Timedelta(minutes=2)):
+    bursts, state, since = 0, 'out', None
+    for t, v in series.items():
+        if state == 'out':
+            if v >= high:
+                bursts, state = bursts + 1, 'in'
+        elif v >= low:
+            state = 'in'
+        elif state == 'in':
+            state, since = 'leaving', t
+        elif t - since >= rest:
+            state = 'out'
+    return bursts
+
+
+def event_shape(valid, event, step, spacing):
+    start, last = pd.Timestamp(event.first_alert) - WINDOW, pd.Timestamp(event.last_alert)
+    history = valid.loc[(valid.index > start - BACKGROUND_SPAN) & (valid.index <= start)]
+    if len(history) < 3:
+        history = valid.loc[(valid.index > start) & (valid.index <= start + REFERENCE_SPAN)]
+    background = history.median()
+    inside = valid.columns[(valid.columns >= event.coordinate_from - 1e-6) & (valid.columns <= event.coordinate_to + 1e-6)]
+    change = (valid.loc[(valid.index > start) & (valid.index <= last), inside] - background[inside]).stack()
+    if change.empty:
+        return {}
+    moment, place = change.abs().idxmax()
+    peak = change.loc[(moment, place)]
+    sign = 1. if peak > 0 else -1.
+    half = abs(peak) / 2
+    series = sign * (valid[place] - background[place])
+    series = series.loc[series.index > start - BACKGROUND_SPAN]
+    smooth = series.rolling('2min', center=True, min_periods=1).median()
+    times = series.index
+    breaks = np.r_[False, np.diff(times.values) > np.timedelta64(MAX_GAP)]
+    flags = smooth.fillna(-np.inf).to_numpy() >= half
+    flags[times.get_loc(moment)] = True
+    low, high = run_bounds(filled(flags), times.get_loc(moment), breaks)
+    span = (times > start) & (times <= last)
+    noise = float(noise_sigma(series.loc[span].to_frame()).iloc[0])
+    bursts = count_bursts(smooth.loc[span], half, half / 2) if half / 2 >= 2 * noise else 1
+    profile = sign * (valid.loc[moment] - background)
+    left, right = run_bounds(filled(profile.fillna(-np.inf).to_numpy() >= half), valid.columns.get_loc(place),
+                             np.zeros(len(profile), dtype=bool))
+    return {'start_time': times[low], 'peak_time': moment, 'peak_place_m': place,
+            'change_from_background_c': round(float(peak), 2),
+            'duration_min': round((times[high] - times[low] + step) / pd.Timedelta(minutes=1), 1),
+            'returned': bool(high < len(times) - 1 and not breaks[high + 1]),
+            'width_m': round(float(valid.columns[right] - valid.columns[left]) + spacing, 2),
+            'extent_from_m': valid.columns[left], 'extent_to_m': valid.columns[right], 'bursts': bursts}
+
+
+def groups(linked):
+    label = np.full(len(linked), -1)
+    for i in range(len(linked)):
+        if label[i] >= 0:
+            continue
+        label[i] = i
+        stack = [i]
+        while stack:
+            for k in np.flatnonzero(linked[stack.pop()]):
+                if label[k] < 0:
+                    label[k] = i
+                    stack.append(k)
+    return label
+
+
+def classify_events(events, matrix):
+    if events.empty:
+        return events
+    valid = matrix.where(matrix > INVALID_BELOW)
+    step = matrix.index.to_series().diff().median()
+    spacing = float(pd.Series(matrix.columns).diff().median())
+    shapes = pd.DataFrame([event_shape(valid, e, step, spacing) for e in events.itertuples()], index=events.index,
+                          columns=['start_time', 'peak_time', 'peak_place_m', 'change_from_background_c', 'duration_min',
+                                   'returned', 'width_m', 'extent_from_m', 'extent_to_m', 'bursts'])
+    events = events.join(shapes)
+    measured = events.duration_min.notna()
+    heating = events.change_from_background_c.fillna(events.peak_change_c).gt(0)
+    events['description'] = events.description.where(events.description.eq('краткий выброс'),
+                                                      heating.map({True: 'нагрев', False: 'охлаждение'}))
+    events['duration_class'] = 'не определена'
+    events.loc[measured, 'duration_class'] = events.duration_min.lt(SHORT_MIN).map(
+        {True: 'кратковременное', False: 'продолжительное'})
+    events.loc[measured & ~events.returned.fillna(True).astype(bool), 'duration_class'] = 'не вернулось к фону до конца данных'
+    events['extent_class'] = events.width_m.ge(WIDE_M).map({True: 'обширное', False: 'локальное'}).where(measured, 'не определена')
+    low = events.extent_from_m.fillna(events.coordinate_from).to_numpy(dtype=float)
+    high = events.extent_to_m.fillna(events.coordinate_to).to_numpy(dtype=float)
+    same_place = (low[:, None] <= high[None, :] + SAME_PLACE_M) & (low[None, :] <= high[:, None] + SAME_PLACE_M)
+    start = pd.to_datetime(events.start_time.fillna(events.first_alert), format='ISO8601')
+    moments = start.map(lambda t: t.value).to_numpy()
+    same_time = np.abs(moments[:, None] - moments[None, :]) <= SAME_TIME.value
+    place = groups(same_place)
+    sign = heating.to_numpy()
+    spot = groups(same_place & (sign[:, None] == sign[None, :]))
+    repeats, periods = [], []
+    for i in range(len(events)):
+        here = np.sort(moments[spot == spot[i]])
+        distinct = here[np.r_[True, np.diff(here) > SAME_TIME.value]]
+        gaps = np.diff(distinct) / pd.Timedelta(minutes=1).value
+        repeats.append(len(distinct))
+        regular = len(gaps) >= 3 and gaps.std() <= PERIODIC_SPREAD * gaps.mean()
+        periods.append(round(gaps.mean()) if regular else np.nan)
+    events['place'] = pd.factorize(place)[0] + 1
+    events['repeats_at_place'], events['period_min'] = repeats, periods
+    events['places_at_same_time'] = [len(set(place[same_time[i]])) for i in range(len(events))]
+    parts = [events.duration_class, events.extent_class,
+             events.repeats_at_place.map(lambda n: f'повторяется: событий на этом месте {n}' if n > 1 else ''),
+             events.places_at_same_time.map(lambda n: f'одновременно на участках: {n}' if n > 1 else ''),
+             events.bursts.map(lambda n: f'пульсирующее: всплесков {int(n)}' if n >= 3 else '')]
+    periodic = events.period_min.notna()
+    parts[2] = parts[2].where(~periodic, 'периодическое: примерно каждые ' + events.period_min.astype('Int64').astype(str) + ' мин')
+    events['classes'] = pd.concat(parts, axis=1).apply(lambda row: ', '.join(p for p in row if p), axis=1)
+    return events
+
+
 def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=110, columns_per_end=24):
     started = time.perf_counter()
     if output.exists() and any(output.iterdir()):
@@ -788,7 +924,7 @@ def heatmap(run, data_dir, out, name='4.csv', model='cnn2d'):
         ax.add_patch(plt.Rectangle((e.coordinate_from - 1, y0), e.coordinate_to - e.coordinate_from + 2, y1 - y0,
                                    fill=False, edgecolor='#4fc3f7', lw=1.4))
     ax.axhline((shown.index[-1] - start) / pd.Timedelta(hours=1) * COMMISSIONING_SHARE, color='white', ls='--', lw=1)
-    ax.set_xlabel('координата вдоль волокна (единица не подтверждена)')
+    ax.set_xlabel('расстояние вдоль волокна, м')
     ax.set_ylabel(f'часы от начала записи ({shown.index[0]})')
     ax.set_title(f'{name}: голубые рамки — события {NAMES[model]} после пусконаладки (пунктир), {len(events)} шт.')
     fig.tight_layout()
@@ -851,8 +987,8 @@ def heat_tracks(points, seconds_scale=10., eps=12., min_points=4, link_minutes=3
         rows.append({'track': number, 'first_time': frame.first_time.min(), 'start_min': frame.start_min.min(),
                      'end_min': frame.end_min.max(), 'spots': len(frame),
                      'coordinate_start': frame.coordinate.iloc[0], 'coordinate_end': frame.coordinate.iloc[-1],
-                     'speed_coord_per_min': speed, 'linearity_r': r, 'peak_excess_c': frame.peak_excess_c.max(),
-                     'direction': 'к большим координатам' if speed > 0 else 'к меньшим координатам',
+                     'speed_m_per_min': speed, 'linearity_r': r, 'peak_excess_c': frame.peak_excess_c.max(),
+                     'direction': 'от начала волокна' if speed > 0 else 'к началу волокна',
                      'description': 'движущийся локальный нагрев' if abs(r) >= .8 else 'серия локальных нагревов',
                      'status': 'требуется проверка'})
     return spots, pd.DataFrame(rows)
@@ -893,11 +1029,11 @@ def tracks_figure(output, out, name='5'):
             if track.description == 'движущийся локальный нагрев' and low <= track.start_min <= high:
                 members = spots.loc[spots.track.eq(track.track)]
                 ax.plot((members.start_min + members.end_min) / 2, members.coordinate, color='#2462a8', lw=1.6)
-                ax.annotate(f'{track.speed_coord_per_min:+.0f} коорд./мин', ((track.start_min + track.end_min) / 2,
+                ax.annotate(f'{track.speed_m_per_min:+.0f} м/мин', ((track.start_min + track.end_min) / 2,
                             (track.coordinate_start + track.coordinate_end) / 2), color='#2462a8', fontsize=9,
                             xytext=(6, 0), textcoords='offset points')
         ax.set_xlabel('минуты от начала записи 5.csv')
-        ax.set_ylabel('координата вдоль волокна')
+        ax.set_ylabel('расстояние вдоль волокна, м')
     fig.colorbar(image, ax=axes, label='на сколько °C выше своего прошлого (6 мин)')
     fig.suptitle('5.csv: краткие локальные нагревы +4…+14 °C и их перемещение вдоль волокна (синие линии - треки)')
     fig.savefig(out / 'fig9_moving_heat_5.png', dpi=150, bbox_inches='tight')
@@ -992,6 +1128,7 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
     later = merge_events(grid.loc[grid.end > cutoff], model + '_notify', columns)
     events = pd.concat([early.assign(period='пусконаладка'),
                         later.assign(period='работа')], ignore_index=True)
+    events = classify_events(events, matrix)
     invalid = matrix.columns[matrix.lt(INVALID_BELOW).any()]
     messages = []
     if len(invalid):
@@ -1043,9 +1180,9 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
                       'slow_changes_journal': len(slow_events), 'forecasts': len(forecasts), 'candidates': len(border),
                       'data_quality_messages': len(messages), 'output': str(output)}, ensure_ascii=False, indent=2))
     if len(events):
-        first = events.sort_values('peak_change_c', key=abs, ascending=False).iloc[0]
-        print(f"Пример: {first.first_alert} — координаты {first.coordinate_from:.1f}–{first.coordinate_to:.1f} — "
-              f"{first.description} {first.peak_change_c:+.1f} °C — {first.status}")
+        first = events.sort_values('change_from_background_c', key=abs, ascending=False).iloc[0]
+        print(f"Пример: {first.first_alert} — {first.coordinate_from:.1f}–{first.coordinate_to:.1f} м — "
+              f"{first.description} {first.change_from_background_c:+.1f} °C — {first.classes} — {first.status}")
 
 
 def main():
