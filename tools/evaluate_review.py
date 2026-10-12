@@ -1,17 +1,3 @@
-"""Честная оценка на реальных данных по слепой разметке человека.
-
-Вход: cases_private.csv (что за случай и откуда, build_review.py), папка с ответами
-(JSON-документы коллекции answers страницы разметки) и прогон со scan_*.csv.gz.
-Выход: real_review_summary.csv и печать главных чисел.
-
-- Реальная точность cnn2d: доля «да — событие» среди СЛУЧАЙНЫХ уведомлений cnn2d (группа alert).
-  Это несмещённая оценка: уведомления выбраны случайно, ответ модели разметчику не показан.
-- Согласие каждой модели с человеком на всех размеченных случаях (выборка не случайная:
-  в ней специально много спорных - поэтому это сравнение моделей между собой, а не их точность).
-- «Не уверен» не превращается в правильный ответ и исключается.
-Доверительный интервал - Уилсона, 95%.
-Запуск: python evaluate_review.py <cases_private.csv> <папка ответов> <папка прогона>
-"""
 import json
 import math
 import sys
@@ -20,12 +6,10 @@ from pathlib import Path
 import pandas as pd
 
 here = Path(__file__).resolve().parent
-root = here.parent if here.name == 'tools' else here   # корень проекта: fiberwatch.py, history/
-sys.path[:0] = [str(root), str(root / 'history')]
+sys.path.insert(0, str(here.parent if here.name == 'tools' else here))
 import fiberwatch as fw
 
 cases_path, answers_dir, run = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
-# Необязательно: поправки после сверки с утверждённой политикой (каждая - с причиной).
 corrections = pd.read_csv(sys.argv[4]).set_index('case_id') if len(sys.argv) > 4 else pd.DataFrame()
 suffix = '_reviewed' if len(corrections) else ''
 
@@ -55,7 +39,6 @@ labelled = cases.loc[cases.decision.notna()].copy()
 print(f'размечено {len(labelled)} из {len(cases)}')
 print(labelled.groupby(['group', 'decision']).size().unstack(fill_value=0).to_string())
 
-# Ответы моделей в той же точке и в тот же момент (ближайшая строка просмотра).
 rows = []
 for case_id, case in labelled.iterrows():
     grid = pd.read_csv(run / f'scan_{case.file.replace(".csv", "")}.csv.gz')
@@ -66,13 +49,13 @@ for case_id, case in labelled.iterrows():
     column = grid.coordinate.iloc[(grid.coordinate - case.coordinate).abs().argsort().iloc[0]]
     at_column = grid.loc[grid.coordinate.eq(column)]
     row = at_column.iloc[(at_column.end - end).abs().argsort().iloc[0]]
-    flags = {f'{m}_zones': str(row.get(f'{m}_zones')) == 'True' for m in fw.MODELS}
+    flags = {f'{m}_notify': str(row.get(f'{m}_notify')) == 'True' for m in fw.MODELS}
     rows.append({'case_id': case_id, 'cnn2d_score': row['cnn2d_score'], **flags})
 labelled = labelled.join(pd.DataFrame(rows).set_index('case_id'))
 decided = labelled.loc[labelled.decision.isin(['event', 'normal', 'glitch'])].copy()
 decided['human_event'] = decided.decision.eq('event')
 rechecked = decided.loc[decided.group.eq('recheck')]
-decided = decided.loc[decided.group.ne('recheck')]   # повтор спорных - проверка согласия человека с собой
+decided = decided.loc[decided.group.ne('recheck')]
 
 summary = []
 alerts = decided.loc[decided.group.eq('alert')]
@@ -93,7 +76,7 @@ if len(rechecked) and 'source_case' in rechecked:
     print('повторный показ спорных случаев:')
     print(rechecked[['source_case', 'decision']].to_string())
 for model in fw.MODELS:
-    flags = decided[f'{model}_zones']
+    flags = decided[f'{model}_notify']
     tp = int((flags & decided.human_event).sum())
     fp = int((flags & ~decided.human_event).sum())
     fn = int((~flags & decided.human_event).sum())

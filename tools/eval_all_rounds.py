@@ -1,15 +1,3 @@
-"""Итоговая оценка моделей на реальной записи по всем раундам слепой разметки.
-
-Почему не «точность на размеченных случаях»: случаи раундов 1-3 выбирались из уведомлений
-CNN, поэтому чужие лишние тревоги почти не попадали к разметчику. Здесь каждое окно полной
-записи (после пусконаладки) относится к слою по ответам двух основных детекторов прогона:
-  A - cnn2d «да» и правило «да», B - только правило, C - только cnn2d, D - обе «нет», но
-  лес или CNN по времени «да», N - никто «нет».
-Доля настоящих событий в слое оценивается по всем размеченным случаям, попавшим в этот слой.
-Точность модели = взвешенная по числу её окон в слоях доля событий; «найдено» = ожидаемое
-число настоящих событийных окон у модели относительно всех, найденных хоть одной моделью.
-Запуск: python eval_all_rounds.py <прогон> <выход.csv>
-"""
 import json
 import math
 import sys
@@ -18,8 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 here = Path(__file__).resolve().parent
-root = here.parent if here.name == 'tools' else here   # корень проекта: fiberwatch.py, history/
-sys.path[:0] = [str(root), str(root / 'history')]
+sys.path.insert(0, str(here.parent if here.name == 'tools' else here))
 import fiberwatch as fw
 
 run, output = Path(sys.argv[1]), Path(sys.argv[2])
@@ -27,7 +14,7 @@ ROUNDS = [(1, 'review/cases/cases_private.csv', 'review/answers_final', 'review/
           (2, 'review/cases2/cases_private.csv', 'review/answers_round2', None),
           (3, 'review/cases3/cases_private.csv', 'review/answers_round3', None),
           (4, 'review/cases4/cases_private.csv', 'review/answers_round4', 'review/review_corrections4.csv')]
-MAIN = ['amplitude_rule', 'random_forest', 'cnn', 'cnn2d']
+MAIN = ['amplitude_rule', 'random_forest', 'cnn2d']
 
 
 def wilson(k, n, z=1.96):
@@ -40,8 +27,8 @@ def wilson(k, n, z=1.96):
 
 
 def stratum(frame):
-    a, b = frame['cnn2d_zones'], frame['amplitude_rule_zones']
-    other = frame['random_forest_zones'] | frame['cnn_zones']
+    a, b = frame['cnn2d_notify'], frame['amplitude_rule_notify']
+    other = frame['random_forest_notify']
     return pd.Series('N', index=frame.index).mask(other, 'D').mask(b & ~a, 'B').mask(a & ~b, 'C').mask(a & b, 'A')
 
 
@@ -68,13 +55,13 @@ for name in sorted(cases.file.unique()):
     grid = pd.read_csv(run / f'scan_{name.replace(".csv", "")}.csv.gz')
     grid['end'] = pd.to_datetime(grid['end'], format='ISO8601')
     for model in fw.MODELS:
-        grid[model + '_zones'] = grid[model + '_zones'].astype(str).eq('True')
+        grid[model + '_notify'] = grid[model + '_notify'].astype(str).eq('True')
     grid['stratum'] = stratum(grid)
     grids[name] = grid
     cutoff = grid.end.min() + (grid.end.max() - grid.end.min()) * fw.COMMISSIONING_SHARE
     late = grid.loc[grid.end > cutoff]
     for model in MAIN:
-        for key, size in late.loc[late[model + '_zones']].stratum.value_counts().items():
+        for key, size in late.loc[late[model + '_notify']].stratum.value_counts().items():
             counts[model][key] = counts[model].get(key, 0) + int(size)
 for case in cases.itertuples():
     grid = grids[case.file]
@@ -83,12 +70,12 @@ for case in cases.itertuples():
         end = end.tz_localize(grid.end.dt.tz)
     at = grid.loc[grid.coordinate.eq(grid.coordinate.iloc[(grid.coordinate - case.coordinate).abs().argsort().iloc[0]])]
     row = at.iloc[(at.end - end).abs().argsort().iloc[0]]
-    flags.append({'stratum': row.stratum, **{m: bool(row[m + '_zones']) for m in MAIN}})
+    flags.append({'stratum': row.stratum, **{m: bool(row[m + '_notify']) for m in MAIN}})
 cases = cases.join(pd.DataFrame(flags))
 
 share = cases.groupby('stratum').human_event.agg(['sum', 'size'])
 share['p'] = share['sum'] / share['size']
-print('слои (по разметке всех раундов):')
+print('слои (по всей разметке):')
 print(share.to_string())
 union = {}
 for model in MAIN:

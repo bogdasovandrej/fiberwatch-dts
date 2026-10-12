@@ -1,21 +1,3 @@
-"""Набор реальных случаев для слепой разметки (честная оценка на сплошной записи).
-
-Источник - scan_*.csv.gz прогона: каждый файл просмотрен моделями, которые его прибор не видели.
-Группы (в странице разметки скрыты, порядок перемешан):
-  alert      - случайные события cnn2d после пусконаладки: доля настоящих = реальная точность;
-  disagree   - cnn2d и CNN по времени ответили по-разному;
-  rule_only  - правило уведомляет, cnn2d нет (возможные пропуски cnn2d);
-  near       - cnn2d чуть ниже своего порога (возможные пропуски);
-  gated      - cnn2d «да», но измеренное изменение ниже правила (возможные пропуски из-за правила);
-  recheck    - повторный показ ранее спорных случаев под новым номером (в точность не входит);
-  раунд 4 (режим disagreement) - окна, где модели РАСХОДЯТСЯ после правила 3 °C:
-  all_agree (все 4 «да»), rule_only / forest_only (они «да», cnn2d «нет»), cnn2d_only (cnn2d «да», правило «нет»),
-  journal (cnn2d «да», правило от фона «нет» - журнал «около порога»), control (все «нет»);
-  glitch     - вероятные одноточечные сбои;
-  control    - случайные окна без уведомлений (контроль).
-Запуск: python build_review.py <папка с CSV> <папка прогона> <папка результата>
-         [<показанные ранее случаи.csv> <первый номер> [<seed> [<спорные для повтора.csv>]]]
-"""
 import random
 import sys
 from pathlib import Path
@@ -26,13 +8,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 here = Path(__file__).resolve().parent
-root = here.parent if here.name == 'tools' else here   # корень проекта: fiberwatch.py, history/
-sys.path[:0] = [str(root), str(root / 'history')]
+sys.path.insert(0, str(here.parent if here.name == 'tools' else here))
 import fiberwatch as fw
 
 data_dir, run, out = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])
 out.mkdir(parents=True, exist_ok=True)
-# Второй раунд: свежие случаи, которых разметчик не видел (исключаем показанные ранее).
 second_round = len(sys.argv) > 4
 shown = pd.read_csv(sys.argv[4]) if second_round else pd.DataFrame(columns=['file', 'coordinate', 'end'])
 first_number = int(sys.argv[5]) if second_round else 1
@@ -43,7 +23,7 @@ recheck = pd.read_csv(sys.argv[7]) if len(sys.argv) > 7 else pd.DataFrame()
 PLAN = ({'all_agree': 2, 'rule_only': 5, 'forest_only': 5, 'cnn2d_only': 5, 'journal': 2, 'control': 1} if disagreement
         else {'alert': 8, 'near': 1, 'gated': 1} if third_round
         else {'alert': 5, 'near': 1, 'control': 1} if second_round
-        else {'alert': 5, 'disagree': 2, 'rule_only': 1, 'near': 2, 'control': 1})
+        else {'alert': 5, 'rule_only': 1, 'near': 2, 'control': 1})
 
 
 def pick(frame, n):
@@ -54,7 +34,7 @@ def pick(frame, n):
 
 def draw(matrix, coordinate, end, path):
     names = list(matrix.columns)
-    centre = int(matrix.columns.get_indexer([coordinate], method='nearest')[0])   # CSV чуть округляет координату
+    centre = int(matrix.columns.get_indexer([coordinate], method='nearest')[0])
     coordinate = names[centre]
     span = matrix.loc[(matrix.index > end - pd.Timedelta(minutes=60)) & (matrix.index <= end + pd.Timedelta(minutes=20))]
     near = [names[i] for i in range(centre - fw.RADIUS, centre + fw.RADIUS + 1) if 0 <= i < len(names) and i != centre]
@@ -91,24 +71,23 @@ for path in sorted(data_dir.glob('[1-6].csv')):
     fold = fitted_thresholds.loc[fitted_thresholds.held_out.str.contains(path.name, regex=False)]
     threshold = float(fold.loc[fold.model.eq('cnn2d'), 'threshold'].iloc[0])
     late = grid.loc[grid.end > cutoff].copy()
-    for column in [m + '_zones' for m in fw.MODELS] + (['cnn2d_border'] if 'cnn2d_border' in late else []):
+    for column in [m + '_notify' for m in fw.MODELS] + (['cnn2d_candidate'] if 'cnn2d_candidate' in late else []):
         late[column] = late[column].astype(str).eq('True')
     columns = list(late.coordinate.drop_duplicates().sort_values())
-    events = fw.merge_events(late, 'cnn2d_zones', columns)
+    events = fw.merge_events(late, 'cnn2d_notify', columns)
     groups = {
         'alert': events.rename(columns={'peak_coordinate': 'coordinate'}).assign(end=None),
-        'disagree': late.loc[late.cnn2d_zones != late.cnn_zones],
-        'rule_only': late.loc[late.amplitude_rule_zones & ~late.cnn2d_zones],
-        'near': late.loc[~late.cnn2d_zones & late.cnn2d_score.between(threshold * .5, threshold)].nlargest(20, 'cnn2d_score'),
-        'control': late.loc[~late.cnn2d_zones & ~late.cnn_zones & ~late.amplitude_rule_zones],
+        'rule_only': late.loc[late.amplitude_rule_notify & ~late.cnn2d_notify],
+        'near': late.loc[~late.cnn2d_notify & late.cnn2d_score.between(threshold * .5, threshold)].nlargest(20, 'cnn2d_score'),
+        'control': late.loc[~late.cnn2d_notify & ~late.amplitude_rule_notify],
     }
     if disagreement:
-        cnn2d, rule, forest = late.cnn2d_zones, late.amplitude_rule_zones, late.random_forest_zones
-        groups.update({'all_agree': late.loc[cnn2d & rule & forest & late.cnn_zones],
+        cnn2d, rule, forest = late.cnn2d_notify, late.amplitude_rule_notify, late.random_forest_notify
+        groups.update({'all_agree': late.loc[cnn2d & rule & forest],
                        'rule_only': late.loc[rule & ~cnn2d], 'forest_only': late.loc[forest & ~cnn2d],
-                       'cnn2d_only': late.loc[cnn2d & ~rule], 'journal': late.loc[late.cnn2d_border],
-                       'control': late.loc[~cnn2d & ~rule & ~forest & ~late.cnn_zones]})
-    if 'limit_c' in late:   # v5.2: модель «да», правило «нет»
+                       'cnn2d_only': late.loc[cnn2d & ~rule], 'journal': late.loc[late.cnn2d_candidate],
+                       'control': late.loc[~cnn2d & ~rule & ~forest]})
+    if 'limit_c' in late:
         model_yes = late.cnn2d.astype(str).eq('True')
         groups['gated'] = late.loc[model_yes & late.level_c.lt(late.limit_c)]
     seen = shown.loc[shown.file.eq(path.name)]
@@ -130,7 +109,7 @@ for path in sorted(data_dir.glob('[1-6].csv')):
             continue
         for _, row in pick(fresh(frame), PLAN[group]).iterrows():
             end = row['end']
-            if group == 'alert':   # момент пика события: окно, где отклонение в пиковой точке наибольшее
+            if group == 'alert':
                 inside = late.loc[late.coordinate.eq(row['coordinate']) & late.end.between(row['first_alert'], row['last_alert'])]
                 end = inside.loc[inside.level_c.idxmax(), 'end'] if len(inside) else row['first_alert']
             cases.append({'group': group, 'file': path.name, 'coordinate': float(row['coordinate']), 'end': pd.Timestamp(end)})
