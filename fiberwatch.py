@@ -945,7 +945,6 @@ def injection_example(data_dir, out):
         ax.set_xlabel('минуты окна')
     axes[0].set_ylabel('°C')
     axes[0].legend(fontsize=8, frameon=False)
-    fig.suptitle('Обучающие примеры: к настоящим измерениям 4.csv добавлены изменения с известной амплитудой', y=1.03)
     fig.tight_layout()
     fig.savefig(out / 'fig2_injection_examples.png', dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -957,24 +956,25 @@ def heatmap(run, data_dir, out, name='4.csv', model='cnn2d'):
     events = events.loc[events.file.eq(name) & events.model.eq(model)].copy()
     for column in ['first_alert', 'last_alert']:
         events[column] = pd.to_datetime(events[column], format='ISO8601')
-    shown = matrix.loc[:, matrix.lt(INVALID_BELOW).sum().eq(0)]
-    fig, ax = plt.subplots(figsize=(12, 5))
-    hours = (shown.index - shown.index[0]) / pd.Timedelta(hours=1)
-    image = ax.pcolormesh(shown.columns, hours, shown.values, cmap='inferno', shading='auto')
-    fig.colorbar(image, ax=ax, label='°C')
-    start = shown.index[0]
-    for _, e in events.iterrows():
-        y0 = (e.first_alert - start) / pd.Timedelta(hours=1) - 40 / 60
-        y1 = (e.last_alert - start) / pd.Timedelta(hours=1)
-        ax.add_patch(plt.Rectangle((e.coordinate_from - 1, y0), e.coordinate_to - e.coordinate_from + 2, y1 - y0,
-                                   fill=False, edgecolor='#4fc3f7', lw=1.4))
-    ax.axhline((shown.index[-1] - start) / pd.Timedelta(hours=1) * COMMISSIONING_SHARE, color='white', ls='--', lw=1)
-    ax.set_xlabel('расстояние вдоль волокна, м')
-    ax.set_ylabel(f'часы от начала записи ({shown.index[0]})')
-    ax.set_title(f'{name}: голубые рамки — события {NAMES[model]} после пусконаладки (пунктир), {len(events)} шт.')
-    fig.tight_layout()
-    fig.savefig(out / f'fig7_heatmap_{name.replace(".csv", "")}.png', dpi=150)
-    plt.close(fig)
+    low, high = events.coordinate_from.min() - 15, events.coordinate_to.max() + 15
+    shown = matrix.loc[:, (matrix.columns >= low) & (matrix.columns <= high) & matrix.lt(INVALID_BELOW).sum().eq(0)]
+    midnight = shown.index[0].normalize()
+    hours = (shown.index - midnight) / pd.Timedelta(hours=1)
+    with plt.rc_context({'font.size': 15}):
+        fig, ax = plt.subplots(figsize=(12, 5))
+        image = ax.pcolormesh(shown.columns, hours, shown.values, cmap='inferno', shading='auto')
+        fig.colorbar(image, ax=ax, label='T, °C')
+        for number, e in enumerate(events.sort_values('first_alert').itertuples(), 1):
+            y0 = (e.first_alert - midnight) / pd.Timedelta(hours=1) - 40 / 60
+            y1 = (e.last_alert - midnight) / pd.Timedelta(hours=1)
+            ax.add_patch(plt.Rectangle((e.coordinate_from - .5, y0), e.coordinate_to - e.coordinate_from + 1, y1 - y0,
+                                       fill=False, edgecolor='#4fc3f7', lw=2))
+            ax.annotate(str(number), (e.coordinate_to + .8, y1), color='#4fc3f7', fontsize=13, weight='bold', va='top')
+        ax.set_xlabel('x, м')
+        ax.set_ylabel('t, ч')
+        fig.tight_layout()
+        fig.savefig(out / f'fig7_heatmap_{name.replace(".csv", "")}.png', dpi=150)
+        plt.close(fig)
 
 
 def render_figures(run, data_dir, annotations_path, cases_dir):
