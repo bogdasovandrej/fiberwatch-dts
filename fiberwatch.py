@@ -646,6 +646,50 @@ def groups(linked):
     return label
 
 
+def plural(n, forms):
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return forms[0]
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return forms[1]
+    return forms[2]
+
+
+def number(value):
+    text = f'{value:.1f}'.replace('.', ',')
+    return text[:-2] if text.endswith(',0') else text
+
+
+def lasting(minutes):
+    if minutes < 1:
+        return 'меньше минуты'
+    return f'{minutes:.0f} мин' if minutes < 90 else f'{number(minutes / 60)} ч'
+
+
+def operator_message(e):
+    t = pd.Timestamp(e.first_alert)
+    offset = None if t.tzinfo is None else t.utcoffset() / pd.Timedelta(hours=1)
+    zone = '' if offset is None else (' UTC' if offset == 0 else f' UTC{offset:+g}')
+    low, high = (e.extent_from_m, e.extent_to_m) if pd.notna(e.extent_from_m) else (e.coordinate_from, e.coordinate_to)
+    digits = 0 if float(low).is_integer() and float(high).is_integer() else 1
+    low, high = (f'{v:.{digits}f}'.replace('.', ',') for v in (low, high))
+    place = f'{low} м' if low == high else f'{low}–{high} м'
+    change = e.change_from_background_c if pd.notna(e.change_from_background_c) else e.peak_change_c
+    parts = [f'{e.description} на {number(abs(change))} °C']
+    if pd.notna(e.duration_min):
+        parts.append(f'длилось {lasting(e.duration_min)}' if e.returned else 'держится до конца записи')
+    if pd.notna(e.period_min):
+        parts.append(f'повторяется здесь примерно каждые {lasting(e.period_min)}')
+    elif e.repeats_at_place > 1:
+        parts.append(f'на этом месте {e.repeats_at_place} {plural(e.repeats_at_place, ("раз", "раза", "раз"))} за запись')
+    if e.places_at_same_time > 1:
+        k = e.places_at_same_time - 1
+        parts.append(f'одновременно ещё на {k} {"участке" if k % 10 == 1 and k % 100 != 11 else "участках"}')
+    if e.bursts >= 3:
+        parts.append(f'то усиливается, то спадает: {e.bursts:.0f} {plural(e.bursts, ("всплеск", "всплеска", "всплесков"))}')
+    return f'{t:%d.%m %H:%M}{zone} — {place} — ' + ', '.join(parts) + ' — требуется проверка'
+
+
 def classify_events(events, matrix):
     if events.empty:
         return events
@@ -692,6 +736,7 @@ def classify_events(events, matrix):
     periodic = events.period_min.notna()
     parts[2] = parts[2].where(~periodic, 'периодическое: примерно каждые ' + events.period_min.astype('Int64').astype(str) + ' мин')
     events['classes'] = pd.concat(parts, axis=1).apply(lambda row: ', '.join(p for p in row if p), axis=1)
+    events['message'] = [operator_message(e) for e in events.itertuples()]
     return events
 
 
@@ -1181,8 +1226,7 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
                       'data_quality_messages': len(messages), 'output': str(output)}, ensure_ascii=False, indent=2))
     if len(events):
         first = events.sort_values('change_from_background_c', key=abs, ascending=False).iloc[0]
-        print(f"Пример: {first.first_alert} — {first.coordinate_from:.1f}–{first.coordinate_to:.1f} м — "
-              f"{first.description} {first.change_from_background_c:+.1f} °C — {first.classes} — {first.status}")
+        print(f'Пример: {first.message}')
 
 
 def main():
