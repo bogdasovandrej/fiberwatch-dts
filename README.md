@@ -67,20 +67,6 @@ python fiberwatch.py --detect data/4.csv --model-dir run_final/models --output r
 
 Если в консоли Windows нечитаемые буквы — запускайте `python -X utf8 fiberwatch.py …`.
 
-## Как устроен код
-
-Главные функции `fiberwatch.py` в порядке работы:
-
-1. `read_source`, `remove_common_mode` — CSV прибора → таблица «время × метры», проверка качества, вычитание сдвига всего волокна.
-2. `represent` — окно 40 минут → 20 интервалов по 2 минуты.
-3. `make_examples` — обучающие окна: искусственные события поверх реального фона.
-4. `SpatialCNN`, `train_cnn`, `fit_all`, `run` — нейросеть по 9 соседним точкам, обучение и проверка на приборе, которого модель не видела.
-5. `scan`, `calibrate` — проход по записи и правило уведомления.
-6. `merge_events` — срабатывания одного участка → одно событие.
-7. `classify_events` — второй этап: тип и класс события.
-8. `forecast_changes`, `slow_changes`, `heat_tracks`, `glitch_points` — прогноз, медленные изменения, движущиеся нагревы, сбои измерения.
-9. `detect` — применение к новой записи (`--detect`).
-
 ## Структура
 
 - `fiberwatch.py` — всё решение;
