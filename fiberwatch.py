@@ -68,7 +68,7 @@ def read_source(path):
         'timezone': str(matrix.index.tz) if matrix.index.tz is not None else 'не указан',
         'profiles': len(matrix), 'coordinates': matrix.shape[1], 'duplicate_profiles_dropped': duplicates,
         'start': str(matrix.index[0]), 'end': str(matrix.index[-1]),
-        'median_step_s': float(step.median()), 'max_gap_min': float(step.max() / 60),
+        'median_step_s': float(step.median()) if step.notna().any() else float('nan'), 'max_gap_min': float(step.max() / 60),
         'gaps_over_10min': int(step.gt(MAX_GAP.total_seconds()).sum()),
         'short_profiles': int(matrix.isna().any(axis=1).sum()),
         'invalid_values': int(invalid.sum().sum()),
@@ -708,7 +708,7 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
         matrix, quality = read_source(path)
         matrices[path.name] = matrix
         qualities.append(quality)
-        print(f"прочитан {path.name}: {quality['profiles']} профилей x {quality['coordinates']} координат", flush=True)
+        print(f"прочитан {path.name}: {quality['profiles']} профилей x {quality['coordinates']} точек", flush=True)
     quality = pd.DataFrame(qualities)
     quality.to_csv(output / 'data_quality.csv', index=False, encoding='utf-8-sig')
     device_of = dict(zip(quality.file, quality.dts_id))
