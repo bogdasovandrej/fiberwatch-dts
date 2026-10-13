@@ -229,10 +229,12 @@ CSV → проверка качества → вычитание общего с
 
 ## 7. Воспроизведение
 
+Обученная модель — в `models/`, данные — в архиве `data.zip` релиза v1.0 (распаковать в папку репозитория).
+
 ```
 pip install -r requirements.txt
-python fiberwatch.py --quick --data-dir data --output check_run   # проверка запуска, ~8 мин
-python fiberwatch.py --data-dir data --output run_final           # полное обучение, ~50 мин на CPU
-python fiberwatch.py --detect data/4.csv --model-dir run_final/models --output result_4
-python tools/class_check.py data run_final/models class_check      # проверка классов, ~1 ч на CPU
+python fiberwatch.py --detect data/4.csv --model-dir models --output result_4   # готовая модель, ~2 мин
+python fiberwatch.py --quick --data-dir data --output check_run                 # проверка запуска, ~8 мин
+python fiberwatch.py --data-dir data --output run_final                         # полное обучение, ~50 мин на CPU
+python tools/class_check.py data models class_check                             # проверка классов, ~1 ч на CPU
 ```

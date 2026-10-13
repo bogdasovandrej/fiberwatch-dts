@@ -39,13 +39,18 @@
 
 ## Запуск
 
-Нужен Python 3.10–3.12 и файлы `1.csv` … `6.csv` в папке `data/` (данные организаторов в репозиторий не входят).
+Нужен Python 3.10–3.12. Обученная модель уже лежит в `models/`. Данные `1.csv` … `6.csv` — в архиве `data.zip` [релиза v1.0](https://github.com/bogdasovandrej/fiberwatch-dts/releases/tag/v1.0): распакуйте его в папку репозитория, получится `data/`.
 
 ```
 pip install -r requirements.txt
+python fiberwatch.py --detect data/4.csv --model-dir models --output result_4   # применить готовую модель, ~2 мин
+```
+
+Обучить модель заново:
+
+```
 python fiberwatch.py --quick --data-dir data --output check_run        # проверка запуска, ~8 мин
 python fiberwatch.py --data-dir data --output run_final                # обучение и проверка, ~50 мин на CPU
-python fiberwatch.py --detect data/4.csv --model-dir run_final/models --output result_4
 ```
 
 Результаты обучения — в `run_final/`: `summary.csv` (качество моделей), `events.csv` (события), `figures/` (графики).
