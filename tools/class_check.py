@@ -168,7 +168,8 @@ def summarize(result, output):
     result['expected_extent'] = np.where(result.kind.eq('wide'), 'обширное', 'локальное')
     got = result.loc[result.detected].copy()
     checks = {
-        'длительность: класс верный': (got.kind.ne('pulsating'), got.duration_class.eq(got.expected_duration)),
+        'длительность: класс верный': (got.kind.ne('pulsating'), got.duration_class.eq(got.expected_duration)
+                                  | (got.kind.eq('persistent') & got.duration_class.eq('после пика разрыв данных'))),
         'протяжённость: класс верный': (got.kind.ne('pulsating'), got.extent_class.eq(got.expected_extent)),
         'повтор на месте: найден': (got.kind.isin(['periodic', 'repeat']), got.repeats_at_place.ge(2)),
         'периодичность: найдена': (got.kind.eq('periodic'), got.period_min.notna()),

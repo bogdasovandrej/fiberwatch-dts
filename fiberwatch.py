@@ -34,6 +34,8 @@ WIDE_M = 5.
 SAME_PLACE_M = 1.
 SAME_TIME = pd.Timedelta(minutes=10)
 PERIODIC_SPREAD = .25
+RETURN_HOLD = pd.Timedelta(minutes=10)
+RETURN_C = 1.
 MODELS = ['amplitude_rule', 'random_forest', 'cnn2d']
 NAMES = {'amplitude_rule': 'Правило: отклонение медианы', 'random_forest': 'Случайный лес',
          'cnn2d': 'CNN время × координата'}
@@ -80,7 +82,7 @@ def read_source(path):
 
 
 def remove_common_mode(matrix):
-    valid = matrix.loc[:, matrix.notna().all() & matrix.ge(INVALID_BELOW).all()]
+    valid = matrix.where(matrix.ge(INVALID_BELOW))
     deviation = valid - valid.rolling('20min', min_periods=3, closed='left').median()
     common = deviation.median(axis=1).fillna(0.)
     common = common.where(common.abs().ge(COMMON_MODE_MIN_C), 0.)
@@ -454,7 +456,7 @@ def exclusion_zones(annotations, matrices):
 
 
 def scan(matrix, fitted, every_minutes=10, max_columns=1500):
-    usable = matrix.columns[matrix.lt(INVALID_BELOW).sum().eq(0)]
+    usable = matrix.columns
     stride = 1 if max_columns is None else max(1, math.ceil(len(usable) / max_columns))
     columns = list(usable[::stride])
     names = list(matrix.columns)
@@ -619,14 +621,34 @@ def event_shape(valid, event, step, spacing):
     low, high = run_bounds(filled(flags), times.get_loc(moment), breaks)
     span = (times > start) & (times <= last)
     noise = float(noise_sigma(series.loc[span].to_frame()).iloc[0])
+    tolerance = min(max(RETURN_C, 3 * noise if noise == noise else RETURN_C), half)
+    level = np.abs(smooth.to_numpy())
+    back, stop, calm = None, len(times) - 1, None
+    for j in range(times.get_loc(moment) + 1, len(times)):
+        if breaks[j]:
+            stop = j - 1
+            break
+        if np.isnan(level[j]):
+            continue
+        if level[j] > tolerance:
+            calm = None
+            continue
+        calm = j if calm is None else calm
+        if times[j] - times[calm] >= RETURN_HOLD:
+            back = calm
+            break
+    gap = back is None and stop < len(times) - 1
+    end = back if back is not None else stop
     bursts = count_bursts(smooth.loc[span], half, half / 2) if half / 2 >= 2 * noise else 1
     profile = sign * (valid.loc[moment] - background)
     left, right = run_bounds(filled(profile.fillna(-np.inf).to_numpy() >= half), valid.columns.get_loc(place),
                              np.zeros(len(profile), dtype=bool))
     return {'start_time': times[low], 'peak_time': moment, 'peak_place_m': place,
             'change_from_background_c': round(float(peak), 2),
-            'duration_min': round((times[high] - times[low] + step) / pd.Timedelta(minutes=1), 1),
-            'returned': bool(high < len(times) - 1 and not breaks[high + 1]),
+            'duration_min': round((times[end] - times[low] + step) / pd.Timedelta(minutes=1), 1),
+            'peak_width_min': round((times[high] - times[low] + step) / pd.Timedelta(minutes=1), 1),
+            'returned': back is not None, 'data_gap_after': gap,
+            'level_at_end_c': round(float(sign * smooth.iloc[stop]) if smooth.iloc[stop] == smooth.iloc[stop] else float('nan'), 2),
             'width_m': round(float(valid.columns[right] - valid.columns[left]) + spacing, 2),
             'extent_from_m': valid.columns[left], 'extent_to_m': valid.columns[right], 'bursts': bursts}
 
@@ -677,7 +699,14 @@ def operator_message(e):
     change = e.change_from_background_c if pd.notna(e.change_from_background_c) else e.peak_change_c
     parts = [f'{e.description} на {number(abs(change))} °C']
     if pd.notna(e.duration_min):
-        parts.append(f'длилось {lasting(e.duration_min)}' if e.returned else 'держится до конца записи')
+        if e.returned:
+            parts.append(f'длилось {lasting(e.duration_min)}')
+        elif e.data_gap_after:
+            parts.append('дальше разрыв в данных')
+        elif abs(e.level_at_end_c) >= abs(change) / 2:
+            parts.append('держится до конца записи')
+        else:
+            parts.append('спало, но к фону не вернулось до конца записи')
     if pd.notna(e.period_min):
         parts.append(f'повторяется здесь примерно каждые {lasting(e.period_min)}')
     elif e.repeats_at_place > 1:
@@ -698,7 +727,8 @@ def classify_events(events, matrix):
     spacing = float(pd.Series(matrix.columns).diff().median())
     shapes = pd.DataFrame([event_shape(valid, e, step, spacing) for e in events.itertuples()], index=events.index,
                           columns=['start_time', 'peak_time', 'peak_place_m', 'change_from_background_c', 'duration_min',
-                                   'returned', 'width_m', 'extent_from_m', 'extent_to_m', 'bursts'])
+                                   'peak_width_min', 'returned', 'data_gap_after', 'level_at_end_c', 'width_m',
+                                   'extent_from_m', 'extent_to_m', 'bursts'])
     events = events.join(shapes)
     measured = events.duration_min.notna()
     heating = events.change_from_background_c.fillna(events.peak_change_c).gt(0)
@@ -708,6 +738,7 @@ def classify_events(events, matrix):
     events.loc[measured, 'duration_class'] = events.duration_min.lt(SHORT_MIN).map(
         {True: 'кратковременное', False: 'продолжительное'})
     events.loc[measured & ~events.returned.fillna(True).astype(bool), 'duration_class'] = 'не вернулось к фону до конца данных'
+    events.loc[measured & events.data_gap_after.fillna(False).astype(bool), 'duration_class'] = 'после пика разрыв данных'
     events['extent_class'] = events.width_m.ge(WIDE_M).map({True: 'обширное', False: 'локальное'}).where(measured, 'не определена')
     low = events.extent_from_m.fillna(events.coordinate_from).to_numpy(dtype=float)
     high = events.extent_to_m.fillna(events.coordinate_to).to_numpy(dtype=float)
@@ -738,6 +769,11 @@ def classify_events(events, matrix):
     events['classes'] = pd.concat(parts, axis=1).apply(lambda row: ', '.join(p for p in row if p), axis=1)
     events['message'] = [operator_message(e) for e in events.itertuples()]
     return events
+
+
+def observed_hours(index, after):
+    steps = index[index > after].to_series().diff()
+    return steps.where(steps <= MAX_GAP).sum() / pd.Timedelta(hours=1)
 
 
 def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=110, columns_per_end=24):
@@ -842,9 +878,11 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
             cutoff = matrix.index[0] + (matrix.index[-1] - matrix.index[0]) * COMMISSIONING_SHARE
             calibrate(grid, fitted)
             later = grid.loc[grid.end > cutoff].copy()
-            later_hours = (matrix.index[-1] - cutoff).total_seconds() / 3600
+            later_hours = observed_hours(matrix.index, cutoff)
             for name in MODELS:
-                events = merge_events(later, name + '_notify', columns)
+                events = merge_events(grid, name + '_notify', columns)
+                if len(events):
+                    events = events.loc[pd.to_datetime(events.first_alert) > cutoff]
                 load_rows.append({'file': name_file, 'model': name, 'windows': len(later), 'hours': later_hours,
                                   'flagged_share': float(later[name + '_notify'].mean()), 'events': len(events),
                                   'events_per_hour': len(events) / later_hours, 'coordinate_stride': stride})
@@ -952,11 +990,16 @@ def injection_example(data_dir, out):
 
 def heatmap(run, data_dir, out, name='4.csv', model='cnn2d'):
     matrix, _ = read_source(data_dir / name)
-    events = pd.read_csv(run / 'events.csv')
-    events = events.loc[events.file.eq(name) & events.model.eq(model)].copy()
+    path = run / 'events.csv'
+    events = pd.read_csv(path) if path.exists() and path.stat().st_size > 5 else pd.DataFrame()
+    events = events.loc[events.file.eq(name) & events.model.eq(model)].copy() if len(events) else \
+        pd.DataFrame(columns=['first_alert', 'last_alert', 'coordinate_from', 'coordinate_to'])
     for column in ['first_alert', 'last_alert']:
         events[column] = pd.to_datetime(events[column], format='ISO8601')
-    low, high = events.coordinate_from.min() - 15, events.coordinate_to.max() + 15
+    if len(events):
+        low, high = events.coordinate_from.min() - 15, events.coordinate_to.max() + 15
+    else:
+        low, high = matrix.columns.min(), matrix.columns.max()
     shown = matrix.loc[:, (matrix.columns >= low) & (matrix.columns <= high) & matrix.lt(INVALID_BELOW).sum().eq(0)]
     midnight = shown.index[0].normalize()
     hours = (shown.index - midnight) / pd.Timedelta(hours=1)
@@ -988,7 +1031,7 @@ def render_figures(run, data_dir, annotations_path, cases_dir):
 
 
 def hot_points(matrix, rise=4.0, history='6min'):
-    valid = matrix.loc[:, matrix.lt(INVALID_BELOW).sum().eq(0)]
+    valid = matrix.where(matrix.ge(INVALID_BELOW))
     baseline = valid.rolling(history, min_periods=3, closed='left').median()
     excess = (valid - baseline).where((valid - baseline).ge(rise)).stack().rename('excess_c').reset_index()
     excess.columns = ['time', 'coordinate', 'excess_c']
@@ -1086,10 +1129,10 @@ def tracks_figure(output, out, name='5'):
 
 
 def slow_changes(matrix, hours=2, every='10min', max_columns=1500):
-    usable = matrix.columns[matrix.notna().all() & matrix.ge(INVALID_BELOW).all()]
-    stride = max(1, math.ceil(len(usable) / max_columns))
-    smooth = matrix[usable[::stride]].rolling('20min', min_periods=3).median()
-    grid = smooth.resample(every).last().dropna(how='all')
+    valid = matrix.where(matrix.ge(INVALID_BELOW))
+    columns = valid.columns[::max(1, math.ceil(valid.shape[1] / max_columns))]
+    smooth = valid[columns].rolling('20min', min_periods=3).median()
+    grid = smooth.resample(every, label='right', closed='right').last().dropna(how='all')
     delta = grid - grid.shift(freq=pd.Timedelta(hours=hours)).reindex(grid.index)
     table = delta.stack().rename('signed_level_c').reset_index()
     table.columns = ['end', 'coordinate', 'signed_level_c']
@@ -1100,11 +1143,10 @@ def slow_changes(matrix, hours=2, every='10min', max_columns=1500):
 
 
 def forecast_changes(matrix, every='10min', max_columns=1500, start_c=1.0, look_minutes=30, horizon_minutes=30):
-    usable = matrix.columns[matrix.notna().all() & matrix.ge(INVALID_BELOW).all()]
-    stride = max(1, math.ceil(len(usable) / max_columns))
-    columns = usable[::stride]
-    smooth = matrix[columns].rolling('20min', min_periods=3).median()
-    grid = smooth.resample(every).last()
+    valid = matrix.where(matrix.ge(INVALID_BELOW))
+    columns = valid.columns[::max(1, math.ceil(valid.shape[1] / max_columns))]
+    smooth = valid[columns].rolling('20min', min_periods=3).median()
+    grid = smooth.resample(every, label='right', closed='right').last()
     steps = int(pd.Timedelta(look_minutes, 'min') / pd.Timedelta(every))
     background = grid.rolling(5, min_periods=3).median().shift(8)
     change = grid - background
@@ -1122,7 +1164,7 @@ def forecast_changes(matrix, every='10min', max_columns=1500, start_c=1.0, look_
 
 
 def glitch_points(matrix, jump=4.0, calm=1.5, history='6min'):
-    valid = matrix.loc[:, matrix.notna().all() & matrix.lt(INVALID_BELOW).sum().eq(0)]
+    valid = matrix.where(matrix.ge(INVALID_BELOW))
     deviation = valid - valid.rolling(history, min_periods=3, closed='left').median()
     isolated = (deviation.abs().ge(jump) & deviation.shift(1, axis=1).abs().lt(calm)
                 & deviation.shift(-1, axis=1).abs().lt(calm) & deviation.shift(-1).abs().lt(calm))
@@ -1169,10 +1211,9 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
     cutoff = matrix.index[0] + (matrix.index[-1] - matrix.index[0]) * COMMISSIONING_SHARE
     calibrate(grid, fitted)
     columns = list(grid.coordinate.drop_duplicates().sort_values())
-    early = merge_events(grid.loc[grid.end <= cutoff], model + '_notify', columns)
-    later = merge_events(grid.loc[grid.end > cutoff], model + '_notify', columns)
-    events = pd.concat([early.assign(period='пусконаладка'),
-                        later.assign(period='работа')], ignore_index=True)
+    events = merge_events(grid, model + '_notify', columns)
+    if len(events):
+        events['period'] = np.where(pd.to_datetime(events.first_alert) <= cutoff, 'пусконаладка', 'работа')
     events = classify_events(events, matrix)
     invalid = matrix.columns[matrix.lt(INVALID_BELOW).any()]
     messages = []
@@ -1197,7 +1238,9 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
                          'description': f'{len(glitches)} одноточечных однозамерных выбросов >= 4 °C; '
                                         'соседи и следующий замер в норме', 'status': 'требуется проверка данных'})
         glitches.to_csv(output / 'probable_glitches.csv', index=False, encoding='utf-8-sig')
-    border = merge_events(grid.loc[grid.end > cutoff], model + '_candidate', columns)
+    border = merge_events(grid, model + '_candidate', columns)
+    if len(border):
+        border = border.loc[pd.to_datetime(border.first_alert) > cutoff]
     if len(border):
         border = border.assign(status='кандидат: изменение от фона меньше порога, без уведомления')
     border.to_csv(output / 'candidates.csv', index=False, encoding='utf-8-sig')
@@ -1221,7 +1264,8 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
     pd.DataFrame(messages).to_csv(output / 'data_quality_messages.csv', index=False, encoding='utf-8-sig')
     (output / 'quality.json').write_text(json.dumps(quality, ensure_ascii=False, indent=2), encoding='utf-8')
     print(json.dumps({'file': path.name, 'model': model, 'events': len(events),
-                      'events_after_commissioning': len(later), 'moving_heat_tracks': len(tracks),
+                      'events_after_commissioning': int(events.period.eq('работа').sum()) if len(events) else 0,
+                      'moving_heat_tracks': len(tracks),
                       'slow_changes_journal': len(slow_events), 'forecasts': len(forecasts), 'candidates': len(border),
                       'data_quality_messages': len(messages), 'output': str(output)}, ensure_ascii=False, indent=2))
     if len(events):
