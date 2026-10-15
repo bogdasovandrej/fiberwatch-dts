@@ -154,7 +154,7 @@ def check(data_dir, model_dir, output, files):
                 if len(match):
                     e = match.sort_values('first_alert').iloc[0]
                     row.update({k: e[k] for k in ['first_alert', 'description', 'change_from_background_c', 'duration_min',
-                                                  'width_m', 'bursts', 'duration_class', 'extent_class', 'repeats_at_place',
+                                                  'width_m', 'duration_class', 'extent_class', 'repeats_at_place',
                                                   'period_min', 'places_at_same_time', 'classes']})
                 rows.append(row)
             print(name, round_name, 'scenarios', len(table), 'detected', sum(r['detected'] for r in rows[-len(table):]), flush=True)
@@ -174,11 +174,9 @@ def summarize(result, output):
         'повтор на месте: найден': (got.kind.isin(['periodic', 'repeat']), got.repeats_at_place.ge(2)),
         'периодичность: найдена': (got.kind.eq('periodic'), got.period_min.notna()),
         'одновременность: найдена': (got.kind.eq('same_time'), got.places_at_same_time.ge(3)),
-        'пульсация: найдена': (got.kind.eq('pulsating'), got.bursts.ge(3)),
         'нет ложного повтора': (got.kind.isin(['short', 'long', 'wide', 'persistent', 'same_time', 'pulsating']),
                                 got.repeats_at_place.eq(1)),
         'нет ложной одновременности': (got.kind.ne('same_time'), got.places_at_same_time.eq(1)),
-        'нет ложной пульсации': (got.kind.ne('pulsating'), got.bursts.lt(3)),
         'тип (нагрев/охлаждение) верный': (got.kind.ne('pulsating'),
                                            got.description.eq(np.where(got.size_c > 0, 'нагрев', 'охлаждение'))),
     }

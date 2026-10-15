@@ -103,7 +103,7 @@ def represent(rows, end):
     if len(rows) < 3 or rows.index.to_series().diff().gt(MAX_GAP).any():
         return None
     position = (rows.index - start) / BIN
-    bin_number = [int(-((-value) // 1)) for value in position]
+    bin_number = np.ceil(position).astype(int)
     reference = reference_level(rows, start)
     relative = rows - reference
     grouped = relative.groupby(pd.Series(bin_number, index=relative.index))
@@ -214,7 +214,7 @@ def injected_shape(kind, minutes, onset, size, rng):
 def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose, augment_noise=False, keep_raw=False):
     names = list(matrix.columns)
     position = {c: i for i, c in enumerate(names)}
-    xs, x2s, feature_tables, passports, raws = [], [], [], [], []
+    x2s, feature_tables, passports, raws = [], [], [], []
     for end in ends:
         start = end - WINDOW
         rows = matrix.loc[(matrix.index > start) & (matrix.index <= end)]
@@ -280,14 +280,10 @@ def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose
         meta = pd.DataFrame(meta)
         if meta.empty:
             continue
-        meta = meta.loc[meta.label.notna()]
-        if meta.empty:
-            continue
         kept = meta.target.tolist()
         injected = rows[local] + delta + added
         parts = represent(injected, end)
         centre = subset(parts, kept)
-        xs.append(to_tensor(centre))
         x2s.append(patches(parts, [lists[t] for t in kept]))
         feature_tables.append(features(centre).reset_index(drop=True))
         level, spike = amplitude(centre)
@@ -298,7 +294,7 @@ def make_examples(matrix, quality, ends, columns_per_end, rng, excluded, purpose
         passports.append(meta.drop(columns='target'))
         if keep_raw:
             raws += [injected[t] for t in kept]
-    result = (torch.cat(xs), torch.cat(x2s), pd.concat(feature_tables, ignore_index=True),
+    result = (torch.cat(x2s), pd.concat(feature_tables, ignore_index=True),
               pd.concat(passports, ignore_index=True))
     return result + (raws,) if keep_raw else result
 
@@ -351,7 +347,7 @@ def train_cnn(x_train, y_train, x_val, y_val, width, seed, factory=SpatialCNN, m
     return model, best, history
 
 
-def scores(name, model, x, table, x2=None):
+def scores(name, model, table, x2=None):
     if name == 'amplitude_rule':
         return pd.Series(table['level_c'].values)
     if name == 'random_forest':
@@ -371,7 +367,7 @@ def choose_threshold(labels, values):
     return float(best)
 
 
-def fit_all(x, x2, table, passport, seed):
+def fit_all(x2, table, passport, seed):
     rng = random.Random(seed)
     slots = sorted(passport[['file', 'end']].drop_duplicates().itertuples(index=False, name=None))
     validation_slots = set(rng.sample(slots, max(1, len(slots) // 5)))
@@ -387,14 +383,13 @@ def fit_all(x, x2, table, passport, seed):
             model = RandomForestClassifier(n_estimators=300, min_samples_leaf=3, n_jobs=-1, random_state=seed)
             model.fit(table.loc[train_idx, FEATURES], passport.label.iloc[train_idx])
         elif name == 'cnn2d':
-            inputs, factory = x2, SpatialCNN
-            trials = [train_cnn(inputs[train_idx], y[train_idx], inputs[val_idx], y[val_idx], width, seed, factory)
+            trials = [train_cnn(x2[train_idx], y[train_idx], x2[val_idx], y[val_idx], width, seed)
                       for width in CNN_WIDTHS]
             model, best_loss, history = min(trials, key=lambda trial: trial[1])
             extra = {'width': model.filters[0].out_channels, 'validation_loss': best_loss,
                      'epochs_run': len(history), 'parameters': sum(p.numel() for p in model.parameters()),
                      'history': [row for trial in trials for row in trial[2]]}
-        values = scores(name, model, x[val_idx], table.loc[val_idx].reset_index(drop=True), x2[val_idx])
+        values = scores(name, model, table.loc[val_idx].reset_index(drop=True), x2[val_idx])
         threshold = choose_threshold(labels_val, values)
         fitted[name] = (model, threshold)
         log.append({'model': name, 'threshold': threshold, **{k: v for k, v in extra.items() if k != 'history'}})
@@ -422,7 +417,7 @@ def load_cards(annotations_path, cases_dir):
 
 
 def card_inputs(cards, sample_ids, annotations, matrices):
-    tensors, tensors2, tables = [], [], []
+    tensors2, tables = [], []
     for sample_id in sample_ids:
         matrix = matrices[annotations.loc[sample_id, 'source_file']]
         names = list(matrix.columns)
@@ -433,13 +428,12 @@ def card_inputs(cards, sample_ids, annotations, matrices):
         parts = represent(local, rows.index[-1])
         target = names[centre]
         own = subset(parts, [target])
-        tensors.append(to_tensor(own))
         tensors2.append(patches(parts, [neighbours(names, centre)]))
         table = features(own)
         table.index = [sample_id]
         table['level_c'], table['spike_c'] = [v.values for v in amplitude(own)]
         tables.append(table)
-    return torch.cat(tensors), torch.cat(tensors2), pd.concat(tables)
+    return torch.cat(tensors2), pd.concat(tables)
 
 
 def exclusion_zones(annotations, matrices):
@@ -456,9 +450,8 @@ def exclusion_zones(annotations, matrices):
 
 
 def scan(matrix, fitted, every_minutes=10, max_columns=1500):
-    usable = matrix.columns
-    stride = 1 if max_columns is None else max(1, math.ceil(len(usable) / max_columns))
-    columns = list(usable[::stride])
+    stride = 1 if max_columns is None else max(1, math.ceil(matrix.shape[1] / max_columns))
+    columns = list(matrix.columns[::stride])
     names = list(matrix.columns)
     position = {c: i for i, c in enumerate(names)}
     ends, last = [], None
@@ -468,7 +461,7 @@ def scan(matrix, fitted, every_minutes=10, max_columns=1500):
             last = end
     rows_out = []
     for end in ends:
-        rows = matrix.loc[(matrix.index > end - WINDOW) & (matrix.index <= end), usable]
+        rows = matrix.loc[(matrix.index > end - WINDOW) & (matrix.index <= end)]
         rows = rows.loc[:, rows.notna().all() & rows.ge(INVALID_BELOW).all()]
         if rows.empty:
             continue
@@ -480,20 +473,18 @@ def scan(matrix, fitted, every_minutes=10, max_columns=1500):
         table = features(own)
         level, spike = amplitude(own)
         table['level_c'] = level
-        x = to_tensor(own)
         x2 = patches(parts, [neighbours(names, position[c]) for c in targets])
-        parts = own
         history = matrix.loc[(matrix.index > end - WINDOW - BACKGROUND_SPAN) & (matrix.index <= end - WINDOW), targets]
-        background = history.where(history > INVALID_BELOW).median()
+        background = history.where(history.ge(INVALID_BELOW)).median()
         from_background = (rows[targets].rolling(2).median() - background).abs().max()
         frame = pd.DataFrame({'end': end, 'coordinate': table.index, 'position': matrix.columns.get_indexer(table.index),
                               'level_c': level.values, 'spike_c': spike.values,
                               'limit_c': notify_limit(table).values,
                               'background_change_c': from_background.reindex(table.index).values,
-                              'signed_level_c': parts['median'].apply(lambda r: r.loc[r.abs().idxmax()], axis=1).values})
+                              'signed_level_c': own['median'].apply(lambda r: r.loc[r.abs().idxmax()], axis=1).values})
         for name in MODELS:
             model, threshold = fitted[name]
-            values = scores(name, model, x, table.reset_index(drop=True), x2)
+            values = scores(name, model, table.reset_index(drop=True), x2)
             frame[name + '_score'] = values.values
             frame[name] = values.ge(threshold).values
         rows_out.append(frame)
@@ -582,19 +573,20 @@ def run_bounds(flags, i, breaks):
     return low, high
 
 
-def count_bursts(series, high, low, rest=pd.Timedelta(minutes=2)):
-    bursts, state, since = 0, 'out', None
-    for t, v in series.items():
-        if state == 'out':
-            if v >= high:
-                bursts, state = bursts + 1, 'in'
-        elif v >= low:
-            state = 'in'
-        elif state == 'in':
-            state, since = 'leaving', t
-        elif t - since >= rest:
-            state = 'out'
-    return bursts
+def back_to_background(times, level, breaks, peak, tolerance):
+    stop, calm = len(times) - 1, None
+    for j in range(peak + 1, len(times)):
+        if breaks[j]:
+            return None, j - 1
+        if np.isnan(level[j]):
+            continue
+        if level[j] > tolerance:
+            calm = None
+            continue
+        calm = j if calm is None else calm
+        if times[j] - times[calm] >= RETURN_HOLD:
+            return calm, stop
+    return None, stop
 
 
 def event_shape(valid, event, step, spacing):
@@ -621,25 +613,12 @@ def event_shape(valid, event, step, spacing):
     low, high = run_bounds(filled(flags), times.get_loc(moment), breaks)
     span = (times > start) & (times <= last)
     noise = float(noise_sigma(series.loc[span].to_frame()).iloc[0])
-    tolerance = min(max(RETURN_C, 3 * noise if noise == noise else RETURN_C), half)
-    level = np.abs(smooth.to_numpy())
-    back, stop, calm = None, len(times) - 1, None
-    for j in range(times.get_loc(moment) + 1, len(times)):
-        if breaks[j]:
-            stop = j - 1
-            break
-        if np.isnan(level[j]):
-            continue
-        if level[j] > tolerance:
-            calm = None
-            continue
-        calm = j if calm is None else calm
-        if times[j] - times[calm] >= RETURN_HOLD:
-            back = calm
-            break
+    if np.isnan(noise):
+        noise = 0.
+    tolerance = min(max(RETURN_C, 3 * noise), half)
+    back, stop = back_to_background(times, np.abs(smooth.to_numpy()), breaks, times.get_loc(moment), tolerance)
     gap = back is None and stop < len(times) - 1
     end = back if back is not None else stop
-    bursts = count_bursts(smooth.loc[span], half, half / 2) if half / 2 >= 2 * noise else 1
     profile = sign * (valid.loc[moment] - background)
     left, right = run_bounds(filled(profile.fillna(-np.inf).to_numpy() >= half), valid.columns.get_loc(place),
                              np.zeros(len(profile), dtype=bool))
@@ -648,9 +627,9 @@ def event_shape(valid, event, step, spacing):
             'duration_min': round((times[end] - times[low] + step) / pd.Timedelta(minutes=1), 1),
             'peak_width_min': round((times[high] - times[low] + step) / pd.Timedelta(minutes=1), 1),
             'returned': back is not None, 'data_gap_after': gap,
-            'level_at_end_c': round(float(sign * smooth.iloc[stop]) if smooth.iloc[stop] == smooth.iloc[stop] else float('nan'), 2),
+            'level_at_end_c': round(float(sign * smooth.iloc[stop]), 2),
             'width_m': round(float(valid.columns[right] - valid.columns[left]) + spacing, 2),
-            'extent_from_m': valid.columns[left], 'extent_to_m': valid.columns[right], 'bursts': bursts}
+            'extent_from_m': valid.columns[left], 'extent_to_m': valid.columns[right]}
 
 
 def groups(linked):
@@ -713,22 +692,20 @@ def operator_message(e):
         parts.append(f'на этом месте {e.repeats_at_place} {plural(e.repeats_at_place, ("раз", "раза", "раз"))} за запись')
     if e.places_at_same_time > 1:
         k = e.places_at_same_time - 1
-        parts.append(f'одновременно ещё на {k} {"участке" if k % 10 == 1 and k % 100 != 11 else "участках"}')
-    if e.bursts >= 3:
-        parts.append(f'то усиливается, то спадает: {e.bursts:.0f} {plural(e.bursts, ("всплеск", "всплеска", "всплесков"))}')
+        parts.append(f'одновременно ещё на {k} {plural(k, ("участке", "участках", "участках"))}')
     return f'{t:%d.%m %H:%M}{zone} — {place} — ' + ', '.join(parts) + ' — требуется проверка'
 
 
 def classify_events(events, matrix):
     if events.empty:
         return events
-    valid = matrix.where(matrix > INVALID_BELOW)
+    valid = matrix.where(matrix.ge(INVALID_BELOW))
     step = matrix.index.to_series().diff().median()
     spacing = float(pd.Series(matrix.columns).diff().median())
     shapes = pd.DataFrame([event_shape(valid, e, step, spacing) for e in events.itertuples()], index=events.index,
                           columns=['start_time', 'peak_time', 'peak_place_m', 'change_from_background_c', 'duration_min',
                                    'peak_width_min', 'returned', 'data_gap_after', 'level_at_end_c', 'width_m',
-                                   'extent_from_m', 'extent_to_m', 'bursts'])
+                                   'extent_from_m', 'extent_to_m'])
     events = events.join(shapes)
     measured = events.duration_min.notna()
     heating = events.change_from_background_c.fillna(events.peak_change_c).gt(0)
@@ -762,8 +739,7 @@ def classify_events(events, matrix):
     events['places_at_same_time'] = [len(set(place[same_time[i]])) for i in range(len(events))]
     parts = [events.duration_class, events.extent_class,
              events.repeats_at_place.map(lambda n: f'повторяется: событий на этом месте {n}' if n > 1 else ''),
-             events.places_at_same_time.map(lambda n: f'одновременно на участках: {n}' if n > 1 else ''),
-             events.bursts.map(lambda n: f'пульсирующее: всплесков {int(n)}' if n >= 3 else '')]
+             events.places_at_same_time.map(lambda n: f'одновременно на участках: {n}' if n > 1 else '')]
     periodic = events.period_min.notna()
     parts[2] = parts[2].where(~periodic, 'периодическое: примерно каждые ' + events.period_min.astype('Int64').astype(str) + ' мин')
     events['classes'] = pd.concat(parts, axis=1).apply(lambda row: ', '.join(p for p in row if p), axis=1)
@@ -821,14 +797,14 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
         test_ends = sorted(test_rng.sample(ends, min(ends_per_file // 2, len(ends))))
         examples[name + ':test'] = make_examples(matrix, quality.set_index('file', drop=False).loc[name], test_ends,
                                                  columns_per_end, test_rng, zones.get(name, []), 'test')
-        print(f"{name}: обучающих окон {len(examples[name][3])}, тестовых {len(examples[name + ':test'][3])}", flush=True)
-    pd.concat([examples[k][3] for k in examples]).to_csv(output / 'synthetic_passport.csv', index=False)
+        print(f"{name}: обучающих окон {len(examples[name][2])}, тестовых {len(examples[name + ':test'][2])}", flush=True)
+    pd.concat([examples[k][2] for k in examples]).to_csv(output / 'synthetic_passport.csv', index=False)
 
     binary = annotations.loc[annotations.label.isin(['событие', 'нет события'])].copy()
     binary['target'] = binary.label.eq('событие').astype(int)
     binary['device'] = binary.source_file.map(device_of)
     if len(binary):
-        card_x, card_x2, card_table = card_inputs(cards, binary.index, annotations, matrices)
+        card_x2, card_table = card_inputs(cards, binary.index, annotations, matrices)
         card_table = card_table.loc[binary.index].reset_index(drop=True)
 
     devices = sorted(set(device_of.values()))
@@ -836,25 +812,23 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
     for fold, device in enumerate(devices, 1):
         train_files = [f for f in matrices if device_of[f] != device]
         test_files = [f for f in matrices if device_of[f] == device]
-        x = torch.cat([examples[f][0] for f in train_files])
-        x2 = torch.cat([examples[f][1] for f in train_files])
-        table = pd.concat([examples[f][2] for f in train_files], ignore_index=True)
-        passport = pd.concat([examples[f][3] for f in train_files], ignore_index=True)
+        x2 = torch.cat([examples[f][0] for f in train_files])
+        table = pd.concat([examples[f][1] for f in train_files], ignore_index=True)
+        passport = pd.concat([examples[f][2] for f in train_files], ignore_index=True)
         table['level_c'] = passport.level_c.values
         assert not set(passport.device) & {device}
         print(f'fold {fold}: проверяем {test_files}, обучаем на {train_files} ({len(passport)} окон)', flush=True)
-        fitted, log = fit_all(x, x2, table, passport, seed)
+        fitted, log = fit_all(x2, table, passport, seed)
         histories += [dict(row, fold=fold) for row in fitted.pop('_cnn_history')]
         fit_logs += [dict(row, fold=fold, held_out=';'.join(test_files)) for row in log]
 
-        tx = torch.cat([examples[f + ':test'][0] for f in test_files])
-        tx2 = torch.cat([examples[f + ':test'][1] for f in test_files])
-        ttable = pd.concat([examples[f + ':test'][2] for f in test_files], ignore_index=True)
-        tpass = pd.concat([examples[f + ':test'][3] for f in test_files], ignore_index=True)
+        tx2 = torch.cat([examples[f + ':test'][0] for f in test_files])
+        ttable = pd.concat([examples[f + ':test'][1] for f in test_files], ignore_index=True)
+        tpass = pd.concat([examples[f + ':test'][2] for f in test_files], ignore_index=True)
         ttable['level_c'] = tpass.level_c.values
         for name in MODELS:
             model, threshold = fitted[name]
-            values = scores(name, model, tx, ttable, tx2)
+            values = scores(name, model, ttable, tx2)
             tpass[name + '_score'] = values.values
             tpass[name] = values.ge(threshold).astype(int).values
 
@@ -862,7 +836,7 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
         idx = [i for i, m in enumerate(mask) if m]
         for name in MODELS if idx else []:
             model, threshold = fitted[name]
-            values = scores(name, model, card_x[idx], card_table.loc[idx].reset_index(drop=True), card_x2[idx])
+            values = scores(name, model, card_table.loc[idx].reset_index(drop=True), card_x2[idx])
             rule_ok = measured_c(card_table).ge(notify_limit(card_table))
             for i, sample_id, value in zip(idx, binary.index[idx], values):
                 card_rows.append({'sample_id': sample_id, 'model': name, 'fold': fold, 'score': float(value),
@@ -935,18 +909,16 @@ def run(data_dir, annotations_path, cases_dir, output, seed=42, ends_per_file=11
     summary = pd.DataFrame(summary)
     summary.to_csv(output / 'summary.csv', index=False, encoding='utf-8-sig')
 
-    x = torch.cat([examples[f][0] for f in matrices])
-    x2 = torch.cat([examples[f][1] for f in matrices])
-    table = pd.concat([examples[f][2] for f in matrices], ignore_index=True)
-    passport = pd.concat([examples[f][3] for f in matrices], ignore_index=True)
+    x2 = torch.cat([examples[f][0] for f in matrices])
+    table = pd.concat([examples[f][1] for f in matrices], ignore_index=True)
+    passport = pd.concat([examples[f][2] for f in matrices], ignore_index=True)
     table['level_c'] = passport.level_c.values
-    fitted, log = fit_all(x, x2, table, passport, seed)
+    fitted, log = fit_all(x2, table, passport, seed)
     fitted.pop('_cnn_history')
     (output / 'models').mkdir()
-    for name in ('cnn2d',):
-        network, network_threshold = fitted[name]
-        torch.save({'state_dict': network.state_dict(), 'width': network.filters[0].out_channels,
-                    'threshold': network_threshold, 'event_c': EVENT_C}, output / 'models' / f'final_{name}.pt')
+    network, network_threshold = fitted['cnn2d']
+    torch.save({'state_dict': network.state_dict(), 'width': network.filters[0].out_channels,
+                'threshold': network_threshold, 'event_c': EVENT_C}, output / 'models' / 'final_cnn2d.pt')
     joblib.dump({name: fitted[name] for name in MODELS if name != 'cnn2d'}, output / 'models' / 'final_other.joblib')
     pd.DataFrame(log).to_csv(output / 'final_settings.csv', index=False)
     protocol = {'background_minutes': 80, 'grey_max_c': GREY_MAX_C, 'common_mode_min_c': COMMON_MODE_MIN_C, 'radius': RADIUS, 'cnn_widths': list(CNN_WIDTHS), 'max_epochs': MAX_EPOCHS, 'seed': seed, 'window_minutes': 40, 'bin_minutes': 2, 'event_c': EVENT_C,
@@ -962,7 +934,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-PLOT_STYLE = ({'font.size': 10, 'axes.spines.top': False, 'axes.spines.right': False})
+PLOT_STYLE = {'font.size': 10, 'axes.spines.top': False, 'axes.spines.right': False}
 
 
 def injection_example(data_dir, out):
@@ -1020,7 +992,7 @@ def heatmap(run, data_dir, out, name='4.csv', model='cnn2d'):
         plt.close(fig)
 
 
-def render_figures(run, data_dir, annotations_path, cases_dir):
+def render_figures(run, data_dir):
     plt.rcParams.update(PLOT_STYLE)
     out = run / 'figures'
     out.mkdir(exist_ok=True)
@@ -1175,13 +1147,12 @@ def glitch_points(matrix, jump=4.0, calm=1.5, history='6min'):
 
 def load_final(model_dir):
     fitted = joblib.load(model_dir / 'final_other.joblib')
-    for name, factory in (('cnn2d', SpatialCNN),):
-        saved = torch.load(model_dir / f'final_{name}.pt', map_location='cpu', weights_only=True)
-        set_event_c(saved.get('event_c', 3.0))
-        network = factory(saved['width'])
-        network.load_state_dict(saved['state_dict'])
-        network.eval()
-        fitted[name] = (network, float(saved['threshold']))
+    saved = torch.load(model_dir / 'final_cnn2d.pt', map_location='cpu', weights_only=True)
+    set_event_c(saved.get('event_c', 3.0))
+    network = SpatialCNN(saved['width'])
+    network.load_state_dict(saved['state_dict'])
+    network.eval()
+    fitted['cnn2d'] = (network, float(saved['threshold']))
     return fitted
 
 
@@ -1220,23 +1191,26 @@ def detect(path, model_dir, output, model='cnn2d', event_c=None):
     if len(invalid):
         messages.append({'type': 'недостоверные данные', 'coordinate_from': float(invalid.min()),
                          'coordinate_to': float(invalid.max()), 'coordinates': len(invalid),
-                         'description': f'значения ниже {INVALID_BELOW} °C физически невозможны', 'status': 'требуется проверка'})
+                         'description': f"значения ниже {str(INVALID_BELOW).replace('.', ',')} °C физически невозможны", 'status': 'требуется проверка'})
     if quality['duplicate_profiles_dropped']:
-        messages.append({'type': 'повтор профиля', 'description': f"{quality['duplicate_profiles_dropped']} профилей с уже "
-                         'встречавшимся временем; оставлен последний', 'status': 'требуется проверка данных'})
+        n = quality['duplicate_profiles_dropped']
+        messages.append({'type': 'повтор профиля', 'status': 'требуется проверка данных',
+                         'description': f"{n} {plural(n, ('профиль', 'профиля', 'профилей'))} с повторным временем; оставлен последний"})
     if len(shifts):
         messages.append({'type': 'общий сдвиг всего волокна', 'time': str(shifts.index.min()), 'until': str(shifts.index.max()),
-                         'description': f'{len(shifts)} профилей сдвинуты целиком на {shifts.abs().min():.1f}-{shifts.abs().max():.1f} °C; '
-                                        'вероятный эффект прибора, вычтен до анализа', 'status': 'требуется проверка прибора'})
+                         'description': f"{len(shifts)} {plural(len(shifts), ('профиль сдвинут', 'профиля сдвинуты', 'профилей сдвинуты'))} "
+                                        f'целиком на {number(shifts.abs().min())}–{number(shifts.abs().max())} °C; '
+                                        'вероятно, эффект прибора, вычтен до анализа', 'status': 'требуется проверка прибора'})
     gaps = matrix.index.to_series().diff()
     for stamp, gap in gaps.loc[gaps.gt(MAX_GAP)].items():
         messages.append({'type': 'разрыв данных', 'time': str(stamp - gap), 'until': str(stamp),
-                         'description': f'нет профилей {gap}', 'status': 'анализ не выполнялся'})
+                         'description': f'нет данных {lasting(gap / pd.Timedelta(minutes=1))}', 'status': 'анализ не выполнялся'})
     glitches = glitch_points(matrix)
     if len(glitches):
         messages.append({'type': 'вероятный сбой измерения', 'coordinates': glitches.coordinate.nunique(),
-                         'description': f'{len(glitches)} одноточечных однозамерных выбросов >= 4 °C; '
-                                        'соседи и следующий замер в норме', 'status': 'требуется проверка данных'})
+                         'description': f"{len(glitches)} {plural(len(glitches), ('выброс', 'выброса', 'выбросов'))} ≥ 4 °C "
+                                        'в одной точке на один замер; соседи и следующий замер в норме',
+                         'status': 'требуется проверка данных'})
         glitches.to_csv(output / 'probable_glitches.csv', index=False, encoding='utf-8-sig')
     border = merge_events(grid, model + '_candidate', columns)
     if len(border):
@@ -1312,7 +1286,7 @@ def main():
     elif not args.figures_only:
         run(args.data_dir, args.annotations, args.cases_dir, args.output, args.seed, args.ends_per_file)
         find_tracks(args.data_dir, args.output / 'tracks')
-    render_figures(args.output, args.data_dir, args.annotations, args.cases_dir)
+    render_figures(args.output, args.data_dir)
 
 
 if __name__ == '__main__':
